@@ -1,0 +1,122 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+/* Custom scrollbar for dark theme */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #1f2937;
+}
+::-webkit-scrollbar-thumb {
+  background: #4b5563;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #6b7280;
+}
+
+/* Asset tree item hover */
+.tree-item:hover {
+  background-color: rgba(59, 130, 246, 0.1);
+}
+.tree-item.selected {
+  background-color: rgba(59, 130, 246, 0.25);
+}
+
+/* ---- Light mode overrides ---- */
+/* When html.light is set, remap the dark gray palette to light equivalents */
+html.light body { background-color: #ffffff; color: #111827; }
+
+html.light .bg-gray-900 { background-color: #ffffff !important; }
+html.light .bg-gray-850 { background-color: #f9fafb !important; }
+html.light .bg-gray-800 { background-color: #f3f4f6 !important; }
+html.light .bg-gray-700 { background-color: #e5e7eb !important; }
+html.light .bg-gray-950 { background-color: #f9fafb !important; }
+html.light .bg-gray-950\/90 { background-color: rgba(249,250,251,0.9) !important; }
+
+html.light .text-gray-100 { color: #111827 !important; }
+html.light .text-gray-200 { color: #1f2937 !important; }
+html.light .text-gray-300 { color: #374151 !important; }
+html.light .text-gray-400 { color: #6b7280 !important; }
+html.light .text-gray-500 { color: #9ca3af !important; }
+html.light .text-gray-600 { color: #d1d5db !important; }
+
+html.light .border-gray-700 { border-color: #e5e7eb !important; }
+html.light .border-gray-600 { border-color: #d1d5db !important; }
+html.light .border-gray-800 { border-color: #f3f4f6 !important; }
+
+/* Inputs and interactive elements */
+html.light .bg-gray-800.border.border-gray-600 { background-color: #ffffff !important; border-color: #d1d5db !important; }
+html.light input { background-color: #ffffff !important; border-color: #d1d5db !important; color: #111827 !important; }
+html.light input::placeholder { color: #9ca3af !important; }
+
+/* Hover states */
+html.light .hover\:bg-gray-800:hover { background-color: #f3f4f6 !important; }
+html.light .hover\:bg-gray-600:hover { background-color: #e5e7eb !important; }
+html.light .hover\:bg-gray-700:hover { background-color: #f3f4f6 !important; }
+html.light .hover\:bg-gray-800\/50:hover { background-color: rgba(243,244,246,0.5) !important; }
+
+/* Dropdown menus */
+html.light .bg-gray-700 { background-color: #ffffff !important; }
+html.light .hover\:bg-gray-600:hover { background-color: #f3f4f6 !important; }
+
+/* Scrollbar for light mode */
+html.light ::-webkit-scrollbar-track { background: #f3f4f6; }
+html.light ::-webkit-scrollbar-thumb { background: #d1d5db; }
+html.light ::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+
+/* Notification light overrides */
+html.light .bg-green-950\/90 { background-color: rgba(240,253,244,0.95) !important; }
+html.light .bg-red-950\/90 { background-color: rgba(254,242,242,0.95) !important; }
+html.light .bg-amber-950\/90 { background-color: rgba(255,251,235,0.95) !important; }
+
+/* Buttons: gray buttons get a subtle tinted background in light mode */
+html.light .bg-gray-600 { background-color: rgba(59, 130, 246, 0.12) !important; }
+html.light .bg-gray-600.text-white { color: #1e40af !important; }
+html.light .hover\:bg-gray-600:hover { background-color: rgba(59, 130, 246, 0.18) !important; }
+html.light .bg-gray-700.hover\:bg-gray-600 { background-color: rgba(0,0,0,0.04) !important; }
+html.light .bg-gray-700.hover\:bg-gray-600:hover { background-color: rgba(0,0,0,0.08) !important; }
+
+/* Colored buttons: slightly lighter in light mode */
+html.light .bg-blue-700 { background-color: #2563eb !important; }
+html.light .bg-blue-600 { background-color: #3b82f6 !important; }
+html.light .bg-green-700 { background-color: #16a34a !important; }
+html.light .bg-amber-700 { background-color: #d97706 !important; }
+
+/* Disabled buttons */
+html.light .disabled\:bg-gray-800:disabled { background-color: #f3f4f6 !important; }
+html.light .disabled\:text-gray-500:disabled { color: #9ca3af !important; }
+
+/* Select dropdowns */
+html.light select { background-color: #ffffff !important; border-color: #d1d5db !important; color: #111827 !important; }
+
+/* Context menu */
+html.light .context-menu { background-color: #ffffff !important; border-color: #e5e7eb !important; }
+html.light .context-menu-item:hover { background-color: rgba(59, 130, 246, 0.08) !important; }
+
+/* Shadow adjustments */
+html.light .shadow-xl { box-shadow: 0 4px 16px rgba(0,0,0,0.1) !important; }
+html.light .shadow-lg { box-shadow: 0 2px 8px rgba(0,0,0,0.08) !important; }
+
+/* Checkerboard transparency pattern */
+.checkerboard-bg {
+  background-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2216%22%20height%3D%2216%22%3E%3Crect%20width%3D%2216%22%20height%3D%2216%22%20fill%3D%22%23222%22/%3E%3Crect%20width%3D%228%22%20height%3D%228%22%20fill%3D%22%23333%22/%3E%3Crect%20x%3D%228%22%20y%3D%228%22%20width%3D%228%22%20height%3D%228%22%20fill%3D%22%23333%22/%3E%3C/svg%3E");
+}
+html.light .checkerboard-bg {
+  background-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2216%22%20height%3D%2216%22%3E%3Crect%20width%3D%2216%22%20height%3D%2216%22%20fill%3D%22%23f0f0f0%22/%3E%3Crect%20width%3D%228%22%20height%3D%228%22%20fill%3D%22%23ddd%22/%3E%3Crect%20x%3D%228%22%20y%3D%228%22%20width%3D%228%22%20height%3D%228%22%20fill%3D%22%23ddd%22/%3E%3C/svg%3E") !important;
+}
