@@ -16,6 +16,7 @@ interface ToolbarProps {
   onToggleTheme?: () => void
   onShowSettings?: () => void
   onShowAbout?: () => void
+  experimentalEnabled?: boolean
 }
 
 function SaveDropdown({
@@ -106,6 +107,7 @@ export function Toolbar({
   onToggleTheme,
   onShowSettings,
   onShowAbout,
+  experimentalEnabled = false,
 }: ToolbarProps) {
   return (
     <div className="h-12 bg-gray-800 border-b border-gray-700 flex items-center px-4 gap-3 shrink-0"
@@ -125,13 +127,15 @@ export function Toolbar({
         >
           Extract All
         </button>
-        <SaveDropdown
-          onInstallToGame={onInstallToGame}
-          onExportAsMod={onExportAsMod}
-          onSave={onSave}
-          disabled={replacementCount === 0 || loading}
-          gameDetected={gameDetected}
-        />
+        {experimentalEnabled && (
+          <SaveDropdown
+            onInstallToGame={onInstallToGame}
+            onExportAsMod={onExportAsMod}
+            onSave={onSave}
+            disabled={replacementCount === 0 || loading}
+            gameDetected={gameDetected}
+          />
+        )}
         {backupCount > 0 && (
           <button
             onClick={onRestoreBackups}

@@ -34,6 +34,7 @@ interface PreviewPanelProps {
   onRevert?: () => void
   isReplaced?: boolean
   onCopyImage?: () => void
+  experimentalEnabled?: boolean
 }
 
 interface CanvasContextMenuState {
@@ -217,11 +218,12 @@ function WwiseBankPreview({ data }: { data: Uint8Array }) {
   )
 }
 
-function ActionButtons({ onExtract, onReplace, onRevert, isReplaced }: {
+function ActionButtons({ onExtract, onReplace, onRevert, isReplaced, experimentalEnabled }: {
   onExtract: () => void
   onReplace?: () => void
   onRevert?: () => void
   isReplaced?: boolean
+  experimentalEnabled?: boolean
 }) {
   return (
     <div className="flex items-center gap-1">
@@ -233,10 +235,18 @@ function ActionButtons({ onExtract, onReplace, onRevert, isReplaced }: {
           Revert
         </button>
       )}
-      {onReplace && (
+      {onReplace ? (
         <button
           onClick={onReplace}
           className="px-2 py-0.5 bg-blue-700 hover:bg-blue-600 rounded text-xs transition-colors"
+        >
+          Replace
+        </button>
+      ) : !experimentalEnabled && (
+        <button
+          disabled
+          title="Enable experimental features in Settings to use Replace"
+          className="px-2 py-0.5 bg-gray-800 text-gray-500 rounded text-xs cursor-not-allowed"
         >
           Replace
         </button>
@@ -251,7 +261,7 @@ function ActionButtons({ onExtract, onReplace, onRevert, isReplaced }: {
   )
 }
 
-export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExtract, onReplace, onRevert, isReplaced, onCopyImage }: PreviewPanelProps) {
+export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExtract, onReplace, onRevert, isReplaced, onCopyImage, experimentalEnabled }: PreviewPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [zoom, setZoom] = useState(1)
   const [canvasContextMenu, setCanvasContextMenu] = useState<CanvasContextMenuState | null>(null)
@@ -341,7 +351,7 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
           <span className="text-gray-400">Zoom: {Math.round(zoom * 100)}%</span>
           {isReplaced && <span className="text-amber-400 text-xs">Modified</span>}
           <div className="flex-1" />
-          <ActionButtons onExtract={onExtract} onReplace={onReplace} onRevert={onRevert} isReplaced={isReplaced} />
+          <ActionButtons onExtract={onExtract} onReplace={onReplace} onRevert={onRevert} isReplaced={isReplaced} experimentalEnabled={experimentalEnabled} />
         </div>
         <div
           className="flex-1 overflow-auto checkerboard-bg"
@@ -398,7 +408,7 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
           <span className="text-gray-400">{(selectedAsset.metadata.formatName as string) || 'Unknown'}</span>
           {isReplaced && <span className="text-amber-400 text-xs">Modified</span>}
           <div className="flex-1" />
-          <ActionButtons onExtract={onExtract} onReplace={onReplace} onRevert={onRevert} isReplaced={isReplaced} />
+          <ActionButtons onExtract={onExtract} onReplace={onReplace} onRevert={onRevert} isReplaced={isReplaced} experimentalEnabled={experimentalEnabled} />
         </div>
         <div className="flex-1 flex items-center justify-center text-gray-500">
           <div className="text-center">
@@ -444,7 +454,7 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
         )}
         {isReplaced && <span className="text-amber-400 text-xs">Modified</span>}
         <div className="flex-1" />
-        <ActionButtons onExtract={onExtract} onReplace={onReplace} onRevert={onRevert} isReplaced={isReplaced} />
+        <ActionButtons onExtract={onExtract} onReplace={onReplace} onRevert={onRevert} isReplaced={isReplaced} experimentalEnabled={experimentalEnabled} />
       </div>
 
       {/* Content area */}

@@ -13,6 +13,7 @@ export interface Preferences {
   jpgQuality: number
   ddsDefaultBackground: 'checkerboard' | 'black' | 'white'
   compressionMode: 'auto' | 'always' | 'never'
+  experimentalFeatures: boolean
 }
 
 const MAX_RECENT = 10
@@ -24,6 +25,7 @@ const defaults: Preferences = {
   jpgQuality: 90,
   ddsDefaultBackground: 'checkerboard',
   compressionMode: 'auto',
+  experimentalFeatures: false,
 }
 
 let prefsPath = ''
@@ -51,6 +53,7 @@ export function loadPreferences(): Preferences {
         jpgQuality: typeof raw.jpgQuality === 'number' ? Math.max(10, Math.min(100, raw.jpgQuality)) : 90,
         ddsDefaultBackground: ['checkerboard', 'black', 'white'].includes(raw.ddsDefaultBackground) ? raw.ddsDefaultBackground : 'checkerboard',
         compressionMode: ['auto', 'always', 'never'].includes(raw.compressionMode) ? raw.compressionMode : 'auto',
+        experimentalFeatures: raw.experimentalFeatures === true,
       }
       return cached
     }
@@ -86,6 +89,7 @@ export function updatePreferences(partial: Partial<Preferences>): void {
   if (partial.jpgQuality !== undefined) prefs.jpgQuality = Math.max(10, Math.min(100, partial.jpgQuality))
   if (partial.ddsDefaultBackground !== undefined) prefs.ddsDefaultBackground = partial.ddsDefaultBackground
   if (partial.compressionMode !== undefined) prefs.compressionMode = partial.compressionMode
+  if (partial.experimentalFeatures !== undefined) prefs.experimentalFeatures = partial.experimentalFeatures
   save()
 }
 

@@ -81,7 +81,7 @@ declare global {
       getStatus: () => Promise<{ oodleLoaded: boolean; sharedDataDirs: number; sharedDataFiles: number; sharedDataPaths: string[]; gameRoot: string | null; gameDetected: boolean; replacementCount: number }>
       openFolder: (folderPath: string) => Promise<void>
       onProgress: (callback: (info: ProgressInfo | null) => void) => () => void
-      getPreferences: () => Promise<{ theme: 'dark' | 'light'; recentFiles: string[]; defaultExportFormat: 'png' | 'jpg'; jpgQuality: number; ddsDefaultBackground: 'checkerboard' | 'black' | 'white'; compressionMode: 'auto' | 'always' | 'never' }>
+      getPreferences: () => Promise<{ theme: 'dark' | 'light'; recentFiles: string[]; defaultExportFormat: 'png' | 'jpg'; jpgQuality: number; ddsDefaultBackground: 'checkerboard' | 'black' | 'white'; compressionMode: 'auto' | 'always' | 'never'; experimentalFeatures: boolean }>
       setTheme: (theme: 'dark' | 'light') => Promise<void>
       updatePreferences: (prefs: Record<string, unknown>) => Promise<void>
       getVersion: () => Promise<string>
@@ -133,6 +133,7 @@ export default function App() {
     jpgQuality: 90,
     ddsDefaultBackground: 'checkerboard',
     compressionMode: 'auto',
+    experimentalFeatures: false,
   })
 
   // Resizable panel widths
@@ -156,6 +157,7 @@ export default function App() {
         jpgQuality: prefs.jpgQuality || 90,
         ddsDefaultBackground: prefs.ddsDefaultBackground || 'checkerboard',
         compressionMode: prefs.compressionMode || 'auto',
+        experimentalFeatures: prefs.experimentalFeatures === true,
       })
     })
     window.electronAPI.getVersion().then(v => setAppVersion(v))
@@ -624,10 +626,11 @@ export default function App() {
               assetData={assetData}
               loading={loading}
               onExtract={handleExtractSelected}
-              onReplace={handleReplace}
-              onRevert={handleRevert}
+              onReplace={settingsData.experimentalFeatures ? handleReplace : undefined}
+              onRevert={settingsData.experimentalFeatures ? handleRevert : undefined}
               isReplaced={isReplaced}
               onCopyImage={handleCopyPreviewAsPng}
+              experimentalEnabled={settingsData.experimentalFeatures}
             />
           </div>
 
@@ -691,13 +694,14 @@ export default function App() {
         onRestoreBackups={handleRestoreBackups}
         hasFile={!!manifest}
         loading={loading}
-        replacementCount={replacedAssets.size}
+        replacementCount={settingsData.experimentalFeatures ? replacedAssets.size : 0}
         backupCount={backupCount}
         gameDetected={gameDetected}
         theme={theme}
         onToggleTheme={toggleTheme}
         onShowSettings={() => setShowSettings(true)}
         onShowAbout={() => setShowAbout(true)}
+        experimentalEnabled={settingsData.experimentalFeatures}
       />
 
       {/* Main content */}

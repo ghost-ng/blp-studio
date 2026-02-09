@@ -6,6 +6,7 @@ export interface SettingsData {
   jpgQuality: number
   ddsDefaultBackground: 'checkerboard' | 'black' | 'white'
   compressionMode: 'auto' | 'always' | 'never'
+  experimentalFeatures: boolean
 }
 
 interface SettingsDialogProps {
@@ -141,7 +142,7 @@ export function SettingsDialog({ open, onClose, settings, onSave }: SettingsDial
           </div>
 
           {/* Saving section */}
-          <div className="mb-2">
+          <div className="mb-4">
             <h3 className="text-xs uppercase tracking-wider text-gray-500 font-medium mb-1">Saving</h3>
             <div className="border-b border-gray-700">
               <SettingRow label="Oodle compression" description="How to compress assets when saving">
@@ -154,6 +155,21 @@ export function SettingsDialog({ open, onClose, settings, onSave }: SettingsDial
                   ]}
                   onChange={v => update('compressionMode', v)}
                 />
+              </SettingRow>
+            </div>
+          </div>
+
+          {/* Advanced section */}
+          <div className="mb-2">
+            <h3 className="text-xs uppercase tracking-wider text-gray-500 font-medium mb-1">Advanced</h3>
+            <div className="border-b border-gray-700">
+              <SettingRow label="Enable experimental features" description="Unlocks asset replacement and save functionality">
+                <button
+                  onClick={() => update('experimentalFeatures', !draft.experimentalFeatures)}
+                  className={`relative w-10 h-5 rounded-full transition-colors ${draft.experimentalFeatures ? 'bg-blue-600' : 'bg-gray-600'}`}
+                >
+                  <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform ${draft.experimentalFeatures ? 'translate-x-5' : ''}`} />
+                </button>
               </SettingRow>
             </div>
           </div>
