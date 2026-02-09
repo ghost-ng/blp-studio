@@ -25,6 +25,8 @@ Grab the latest portable EXE from [Releases](https://github.com/ghost-ng/blp-stu
 - **Civilization VII** installed via Steam (for Oodle DLL auto-detection)
 - If the game is not installed or installed in a non-standard location, place `oo2core_9_win64.dll` in the app's `resources/` folder
 
+> **Disclaimer:** `oo2core_9_win64.dll` is the Oodle decompression library, proprietary software owned by Epic Games. It is **not** created by or affiliated with this project. BLP Studio includes a copy solely to enable decompression of Civilization VII assets. All rights to the Oodle SDK belong to Epic Games, Inc.
+
 ## Quick start (users)
 
 1. Download `BLP-Studio-*-portable.exe` from Releases

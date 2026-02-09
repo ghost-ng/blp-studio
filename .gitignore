@@ -5,8 +5,8 @@ node_modules/
 out/
 dist/
 
-# Native DLLs (not redistributable)
-*.dll
+# Native DLLs (keep resources/oo2core_9_win64.dll tracked)
+# *.dll
 
 # OS files
 .DS_Store
