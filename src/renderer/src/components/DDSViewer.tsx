@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react'
 import { DDSInfoPanel } from './DDSInfoPanel'
+import { ColorInspector, pickPixel, PickedColor } from './ColorInspector'
 
 export interface DDSData {
   filepath: string
@@ -43,6 +44,7 @@ export function DDSViewer({ dds, onClose, onNotify, onCompare, onBatchExport }: 
   const [loadingMip, setLoadingMip] = useState(false)
   const [showInfo, setShowInfo] = useState(true)
   const [showGrid, setShowGrid] = useState(false)
+  const [pickedColor, setPickedColor] = useState<PickedColor | null>(null)
 
   // Reset state when dds changes
   useEffect(() => {
@@ -125,6 +127,14 @@ export function DDSViewer({ dds, onClose, onNotify, onCompare, onBatchExport }: 
     const delta = e.deltaY > 0 ? 0.9 : 1.1
     setZoom(prev => Math.max(0.1, Math.min(20, prev * delta)))
   }
+
+  const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!canvasRef.current || !currentPixels) return
+    const rect = canvasRef.current.getBoundingClientRect()
+    const px = Math.floor((e.clientX - rect.left) / zoom)
+    const py = Math.floor((e.clientY - rect.top) / zoom)
+    setPickedColor(pickPixel(currentPixels, currentWidth, px, py))
+  }, [currentPixels, currentWidth, zoom])
 
   const handleExport = useCallback(async (format: 'png' | 'jpg') => {
     try {
@@ -342,11 +352,13 @@ export function DDSViewer({ dds, onClose, onNotify, onCompare, onBatchExport }: 
             <div className="relative" style={{ flexShrink: 0 }}>
               <canvas
                 ref={canvasRef}
+                onClick={handleCanvasClick}
                 style={{
                   display: 'block',
                   width: currentWidth * zoom,
                   height: currentHeight * zoom,
                   imageRendering: zoom > 2 ? 'pixelated' : 'auto',
+                  cursor: 'crosshair',
                 }}
               />
               {showGridOverlay && (
@@ -374,6 +386,9 @@ export function DDSViewer({ dds, onClose, onNotify, onCompare, onBatchExport }: 
           />
         )}
       </div>
+
+      {/* Color inspector */}
+      <ColorInspector color={pickedColor} onClose={() => setPickedColor(null)} />
 
       {/* Info bar */}
       <div className="h-6 bg-gray-800 border-t border-gray-700 flex items-center px-3 text-xs text-gray-400 shrink-0">

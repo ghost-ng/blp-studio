@@ -28,5 +28,8 @@ Desktop.ini
 *.log
 npm-debug.log*
 
+# Project files
+TODO.md
+
 # Temp files
 nul

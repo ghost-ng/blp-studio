@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useState, useMemo, useCallback } from 'react'
+import { ColorInspector, pickPixel, PickedColor } from './ColorInspector'
 
 interface AssetEntry {
   name: string
@@ -266,6 +267,7 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
   const [zoom, setZoom] = useState(1)
   const [canvasContextMenu, setCanvasContextMenu] = useState<CanvasContextMenuState | null>(null)
   const canvasMenuRef = useRef<HTMLDivElement>(null)
+  const [pickedColor, setPickedColor] = useState<PickedColor | null>(null)
 
   // Close context menu on outside click or Escape
   useEffect(() => {
@@ -316,6 +318,14 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
     const delta = e.deltaY > 0 ? 0.9 : 1.1
     setZoom(prev => Math.max(0.1, Math.min(10, prev * delta)))
   }
+
+  const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!canvasRef.current || !preview) return
+    const rect = canvasRef.current.getBoundingClientRect()
+    const px = Math.floor((e.clientX - rect.left) / zoom)
+    const py = Math.floor((e.clientY - rect.top) / zoom)
+    setPickedColor(pickPixel(preview.rgbaPixels, preview.width, px, py))
+  }, [preview, zoom])
 
   if (!selectedAsset) {
     return (
@@ -368,11 +378,13 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
           }}>
             <canvas
               ref={canvasRef}
+              onClick={handleCanvasClick}
               style={{
                 width: preview.width * zoom,
                 height: preview.height * zoom,
                 flexShrink: 0,
                 imageRendering: zoom > 2 ? 'pixelated' : 'auto',
+                cursor: 'crosshair',
               }}
             />
           </div>
@@ -392,6 +404,8 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
             </button>
           </div>
         )}
+        {/* Color inspector */}
+        <ColorInspector color={pickedColor} onClose={() => setPickedColor(null)} />
       </div>
     )
   }
