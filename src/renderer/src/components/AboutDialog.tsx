@@ -1,4 +1,5 @@
 import React, { useEffect, useRef } from 'react'
+import appIcon from '../assets/icon.png'
 
 interface AboutDialogProps {
   open: boolean
@@ -29,7 +30,7 @@ export function AboutDialog({ open, onClose, version }: AboutDialogProps) {
         className="bg-gray-800 border border-gray-600 rounded-lg shadow-xl w-[360px] p-6 text-center"
         onClick={e => e.stopPropagation()}
       >
-        <div className="text-4xl mb-3">{'\u{1F3A8}'}</div>
+        <img src={appIcon} alt="BLP Studio" className="w-16 h-16 mx-auto mb-3" />
         <h1 className="text-xl font-bold text-gray-100 mb-1">BLP Studio</h1>
         <p className="text-sm text-amber-400 mb-1">BETA</p>
         <p className="text-sm text-gray-400 mb-4">v{version}</p>

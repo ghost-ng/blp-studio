@@ -6,6 +6,7 @@ interface DDSInfoPanelProps {
   currentMip: number
   currentWidth: number
   currentHeight: number
+  pixels?: Uint8Array
 }
 
 // ---------------------------------------------------------------------------
@@ -117,10 +118,12 @@ function analyzeAlpha(pixels: Uint8Array, dxgiFormat: number): AlphaAnalysis {
 
   let allOpaque = true
   let allTransparent = true
-  const step = Math.max(4, 64 * 4) // check every 64th pixel (stride 4 bytes per pixel)
+  const totalPixels = (pixels.length / 4) | 0
+  const sampleCount = Math.min(totalPixels, 2048)
+  const step = Math.max(1, (totalPixels / sampleCount) | 0)
 
-  for (let i = 3; i < pixels.length; i += step) {
-    const a = pixels[i]
+  for (let p = 0; p < totalPixels; p += step) {
+    const a = pixels[p * 4 + 3]
     if (a !== 255) allOpaque = false
     if (a !== 0) allTransparent = false
     if (!allOpaque && !allTransparent) break
@@ -160,9 +163,13 @@ function analyzeColorRange(pixels: Uint8Array): ColorRange {
 
   if (!pixels || pixels.length < 4) return result
 
-  const step = Math.max(4, 64 * 4)
+  // Sample up to ~2048 pixels evenly distributed across the image
+  const totalPixels = (pixels.length / 4) | 0
+  const sampleCount = Math.min(totalPixels, 2048)
+  const step = Math.max(1, (totalPixels / sampleCount) | 0)
 
-  for (let i = 0; i < pixels.length; i += step) {
+  for (let p = 0; p < totalPixels; p += step) {
+    const i = p * 4
     const r = pixels[i]
     const g = pixels[i + 1]
     const b = pixels[i + 2]
@@ -242,17 +249,21 @@ function ColorBar({ label, min, max, color }: { label: string; min: number; max:
 // Main component
 // ---------------------------------------------------------------------------
 
-export function DDSInfoPanel({ dds, currentMip, currentWidth, currentHeight }: DDSInfoPanelProps) {
+export function DDSInfoPanel({ dds, currentMip, currentWidth, currentHeight, pixels }: DDSInfoPanelProps) {
+  // Use explicit pixels prop (from DDSViewer's currentPixels state) when available,
+  // falling back to dds.rgbaPixels. This ensures we analyze the same data the canvas displays.
+  const pixelData = pixels ?? dds?.rgbaPixels ?? null
+
   // Compute analysis results (memoized for performance)
   const alphaAnalysis = useMemo(() => {
-    if (!dds) return null
-    return analyzeAlpha(dds.rgbaPixels, dds.dxgiFormat)
-  }, [dds?.rgbaPixels, dds?.dxgiFormat])
+    if (!dds || !pixelData) return null
+    return analyzeAlpha(pixelData, dds.dxgiFormat)
+  }, [pixelData, dds?.dxgiFormat])
 
   const colorRange = useMemo(() => {
-    if (!dds) return null
-    return analyzeColorRange(dds.rgbaPixels)
-  }, [dds?.rgbaPixels])
+    if (!pixelData) return null
+    return analyzeColorRange(pixelData)
+  }, [pixelData])
 
   const mipTable = useMemo(() => {
     if (!dds) return []

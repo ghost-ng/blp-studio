@@ -32,13 +32,30 @@ interface ReplacementData {
 }
 const replacements: Map<string, ReplacementData> = new Map()
 
+// ---- Icon ----
+function getAppIcon(): Electron.NativeImage | undefined {
+  // Packaged: process.resourcesPath/resources/icon.png
+  // Dev: project root/resources/icon.png
+  const candidates = [
+    join(process.resourcesPath || '', 'resources', 'icon.png'),
+    join(process.cwd(), 'resources', 'icon.png'),
+    join(__dirname, '../../resources', 'icon.png'),
+  ]
+  for (const p of candidates) {
+    if (existsSync(p)) return nativeImage.createFromPath(p)
+  }
+  return undefined
+}
+
 // ---- Window ----
 function createWindow() {
+  const icon = getAppIcon()
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
     minWidth: 900,
     minHeight: 600,
+    icon,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       nodeIntegration: false,
