@@ -34,8 +34,7 @@
 - [ ] Diff against vanilla assets -- compare modified package against original game files
 - [ ] Mod package templates -- pre-configured templates for common mod types
 - [ ] Asset dependency graph -- visualize texture/material/model relationships
-- [ ] Launch external editor -- open asset in GIMP, Paint.NET, etc. directly from BLP Studio
-- [ ] Watch folder auto-import -- monitor directory for changed files, auto-update package
+
 
 ## UI / UX
 
