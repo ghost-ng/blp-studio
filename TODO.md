@@ -13,7 +13,6 @@
 
 ## DDS Viewer
 
-- [ ] Pixel inspector -- click to see exact RGBA values and coordinates
 - [ ] Texture tiling preview -- 2x2 / 3x3 grid to check seamless tiling
 - [ ] Histogram display -- RGB histogram for color distribution analysis
 - [ ] Normal map validation -- detect incorrect encoding, offer conversion

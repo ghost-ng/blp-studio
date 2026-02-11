@@ -37,6 +37,10 @@ html, body, #root {
 .tree-item.selected {
   background-color: rgba(59, 130, 246, 0.25);
 }
+.tree-item.multi-selected {
+  background-color: rgba(59, 130, 246, 0.20);
+  border-left: 2px solid rgba(59, 130, 246, 0.6);
+}
 
 /* ---- Light mode overrides ---- */
 /* When html.light is set, remap the dark gray palette to light equivalents */
@@ -116,6 +120,13 @@ html.light .context-menu-item:hover { background-color: rgba(59, 130, 246, 0.08)
 /* Shadow adjustments */
 html.light .shadow-xl { box-shadow: 0 4px 16px rgba(0,0,0,0.1) !important; }
 html.light .shadow-lg { box-shadow: 0 2px 8px rgba(0,0,0,0.08) !important; }
+
+/* Status bar indeterminate loading animation */
+@keyframes statusbar-slide {
+  0% { transform: translateX(-100%); }
+  50% { transform: translateX(200%); }
+  100% { transform: translateX(-100%); }
+}
 
 /* Checkerboard transparency pattern */
 .checkerboard-bg {

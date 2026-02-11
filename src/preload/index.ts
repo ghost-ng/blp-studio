@@ -82,6 +82,19 @@ export interface ElectronAPI {
   extractTempDds: (name: string) => Promise<string | null>
   exportTextureAsImage: (name: string, format: string, quality?: number) => Promise<{ filepath: string; size: number } | { error: string } | null>
   copyPreviewAsPng: (rgbaPixels: Uint8Array, width: number, height: number) => Promise<boolean>
+  exportManifest: (manifestJson: string, defaultFilename: string) => Promise<{ filepath: string; size: number } | null>
+  exportDep: (modId: string, defaultFilename: string) => Promise<{ filepath: string; size: number } | null>
+  getDepText: (modId: string) => Promise<string | null>
+  getModinfoText: (modId: string, modName: string) => Promise<string | null>
+  saveTextFile: (text: string, defaultFilename: string, filterName: string, filterExt: string) => Promise<{ filepath: string; size: number } | null>
+  parseWwiseBank: (name: string) => Promise<{ bankVersion: number; bankId: number; embeddedFiles: { id: number; size: number }[] } | null>
+  extractWwiseAudio: (name: string, fileId: number) => Promise<{ data: Uint8Array; id: number } | null>
+  extractAllWwiseAudio: (name: string, outputDir: string) => Promise<{ success: number; failed: number }>
+  extractBlobsByType: (blobType: number, outputDir: string) => Promise<{ success: number; failed: number }>
+  exportTexturesBatch: (names: string[], outputDir: string, format: string, quality?: number) => Promise<{ success: number; failed: number }>
+  getThumbnails: (names: string[]) => Promise<Record<string, { width: number; height: number; rgbaPixels: Uint8Array }>>
+  preloadTextures: () => Promise<{ loaded: number; total: number }>
+  onPreloadProgress: (callback: (info: ProgressInfo) => void) => () => void
   onDdsLoadFile: (callback: (filepath: string) => void) => () => void
 }
 
@@ -150,6 +163,23 @@ const api: ElectronAPI = {
   extractTempDds: (name) => ipcRenderer.invoke('asset:extract-temp-dds', name),
   exportTextureAsImage: (name, format, quality?) => ipcRenderer.invoke('asset:export-as-image', name, format, quality),
   copyPreviewAsPng: (rgbaPixels, width, height) => ipcRenderer.invoke('preview:copy-as-png', rgbaPixels, width, height),
+  exportManifest: (manifestJson, defaultFilename) => ipcRenderer.invoke('blp:export-manifest', manifestJson, defaultFilename),
+  exportDep: (modId, defaultFilename) => ipcRenderer.invoke('blp:export-dep', modId, defaultFilename),
+  getDepText: (modId) => ipcRenderer.invoke('blp:get-dep-text', modId),
+  getModinfoText: (modId, modName) => ipcRenderer.invoke('blp:get-modinfo-text', modId, modName),
+  saveTextFile: (text, defaultFilename, filterName, filterExt) => ipcRenderer.invoke('blp:save-text-file', text, defaultFilename, filterName, filterExt),
+  parseWwiseBank: (name) => ipcRenderer.invoke('asset:parse-wwise', name),
+  extractWwiseAudio: (name, fileId) => ipcRenderer.invoke('asset:extract-wwise-audio', name, fileId),
+  extractAllWwiseAudio: (name, outputDir) => ipcRenderer.invoke('asset:extract-all-wwise', name, outputDir),
+  extractBlobsByType: (blobType, outputDir) => ipcRenderer.invoke('asset:extract-blobs-by-type', blobType, outputDir),
+  exportTexturesBatch: (names, outputDir, format, quality?) => ipcRenderer.invoke('asset:export-textures-batch', names, outputDir, format, quality),
+  getThumbnails: (names) => ipcRenderer.invoke('asset:thumbnails', names),
+  preloadTextures: () => ipcRenderer.invoke('blp:preload-textures'),
+  onPreloadProgress: (callback) => {
+    const handler = (_event: Electron.IpcRendererEvent, info: ProgressInfo) => callback(info)
+    ipcRenderer.on('preload-progress', handler)
+    return () => ipcRenderer.removeListener('preload-progress', handler)
+  },
   onDdsLoadFile: (callback) => {
     const handler = (_event: Electron.IpcRendererEvent, filepath: string) => callback(filepath)
     ipcRenderer.on('dds:load-file', handler)

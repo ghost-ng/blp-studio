@@ -14,6 +14,7 @@ import {
 } from '../core/game-detect'
 import { decodeBCn } from '../core/bcn-decoder'
 import { generateModinfo, generateDep, sanitizeModId } from '../core/mod-manifest'
+import { parseWwiseBank, extractWemFile } from '../core/wwise-bank'
 import { initPreferences, loadPreferences, setTheme, updatePreferences, addRecentFile, clearRecentFiles } from '../core/preferences'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, unlinkSync } from 'fs'
 
@@ -24,6 +25,12 @@ let sdIndex: Map<string, string> = new Map()
 let oodle: OodleDecompressor | null = null
 let gameRoot: string | null = null
 let sdDirs: string[] = []
+// Preloaded texture preview cache (name -> preview result)
+const texturePreviewCache = new Map<string, { name: string; width: number; height: number; mips: number; dxgiFormat: number; dxgiFormatName: string; rgbaPixels: Buffer }>()
+let previewCacheBytes = 0
+let previewCacheFilepath = '' // filepath the cache belongs to
+let preloadGeneration = 0    // incremented on blp:open to cancel in-flight preloads
+const MAX_CACHE_BYTES = 512 * 1024 * 1024 // 512 MB memory budget
 
 // Replacement data: maps asset name → raw replacement bytes + DDS metadata
 interface ReplacementData {
@@ -131,10 +138,25 @@ function buildMenu() {
   const prefs = loadPreferences()
   const recentFiles = prefs.recentFiles
 
+  const truncatePath = (fp: string, maxLen = 60): string => {
+    if (fp.length <= maxLen) return fp
+    const parts = fp.split(/[/\\]/)
+    const filename = parts.pop() || fp
+    const drive = parts.shift() || ''
+    // Keep drive + ... + last folder(s) + filename
+    let tail = filename
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const candidate = parts[i] + '\\' + tail
+      if ((drive + '\\...\\' + candidate).length > maxLen) break
+      tail = candidate
+    }
+    return drive + '\\..\\' + tail
+  }
+
   const recentSubmenu: Electron.MenuItemConstructorOptions[] = recentFiles.length > 0
     ? [
         ...recentFiles.map(filepath => ({
-          label: filepath.split(/[/\\]/).pop() || filepath,
+          label: truncatePath(filepath),
           click: () => mainWindow?.webContents.send('menu:open-file', filepath),
           toolTip: filepath,
         })),
@@ -276,16 +298,21 @@ function collectAssets(parser: BLPParser): AssetEntry[] {
     const name = obj.m_Name as string
     if (!name || seen.has(name)) continue
     seen.add(name)
+    const w = (obj.m_nWidth as number) || 0
+    const h = (obj.m_nHeight as number) || 0
+    const mipCount = (obj.m_nMips as number) || 1
+    const fmt = (obj.m_eFormat as number) || 0
     assets.push({
       name,
       type: 'texture',
       metadata: {
-        width: obj.m_nWidth,
-        height: obj.m_nHeight,
-        mips: obj.m_nMips,
-        format: obj.m_eFormat,
-        formatName: dxgiName(obj.m_eFormat as number || 0),
+        width: w,
+        height: h,
+        mips: mipCount,
+        format: fmt,
+        formatName: dxgiName(fmt),
         size: obj.m_nSize,
+        rawSize: calcTextureSize(w, h, mipCount, fmt),
         offset: obj.m_nOffset,
         flags: obj.m_mFlags,
         textureClass: obj.m_TextureClass,
@@ -458,6 +485,13 @@ function setupIPC() {
       parser.parse()
       currentParser = parser
       replacements.clear()
+      preloadGeneration++
+      // Only clear cache if opening a different file (tab switch re-opens same file)
+      if (previewCacheFilepath !== filepath) {
+        texturePreviewCache.clear()
+        previewCacheBytes = 0
+        previewCacheFilepath = filepath
+      }
 
       // Init SHARED_DATA from BLP path
       initSharedData(filepath)
@@ -504,6 +538,10 @@ function setupIPC() {
   ipcMain.handle('asset:preview', async (_e, name: string) => {
     if (!isString(name) || !currentParser) return null
 
+    // Check preload cache first
+    const cached = texturePreviewCache.get(name)
+    if (cached) return cached
+
     // Find the asset
     for (const alloc of currentParser.iterEntriesByType('BLP::TextureEntry')) {
       const obj = currentParser.deserializeAlloc(alloc)
@@ -515,7 +553,7 @@ function setupIPC() {
       const fmt = (obj.m_eFormat as number) || 0
 
       // Cap preview size to prevent OOM on huge textures (RGBA8 = 4 bytes/pixel)
-      const MAX_PREVIEW_PIXELS = 4096 * 4096  // 64MB RGBA limit
+      const MAX_PREVIEW_PIXELS = 2048 * 2048  // 16MB RGBA limit
       if (w * h > MAX_PREVIEW_PIXELS) {
         return {
           name,
@@ -556,6 +594,71 @@ function setupIPC() {
     return null
   })
 
+  // ---- Preload all texture previews into cache ----
+  ipcMain.handle('blp:preload-textures', async () => {
+    if (!currentParser || !mainWindow) return { loaded: 0, total: 0 }
+
+    const gen = ++preloadGeneration
+    const MAX_PREVIEW_PIXELS = 2048 * 2048
+    const textures: { name: string; w: number; h: number; mips: number; fmt: number }[] = []
+
+    for (const alloc of currentParser.iterEntriesByType('BLP::TextureEntry')) {
+      const obj = currentParser.deserializeAlloc(alloc)
+      const name = obj.m_Name as string
+      if (!name || texturePreviewCache.has(name)) continue
+      const w = (obj.m_nWidth as number) || 0
+      const h = (obj.m_nHeight as number) || 0
+      if (w * h > MAX_PREVIEW_PIXELS || w === 0 || h === 0) continue
+      textures.push({ name, w, h, mips: (obj.m_nMips as number) || 1, fmt: (obj.m_eFormat as number) || 0 })
+    }
+
+    const total = textures.length
+    let loaded = 0
+    let lastProgressTime = Date.now()
+
+    for (const tex of textures) {
+      // Cancel if a new file was opened
+      if (preloadGeneration !== gen) return { loaded, total }
+      // Stop if memory budget exceeded
+      if (previewCacheBytes >= MAX_CACHE_BYTES) {
+        mainWindow?.webContents.send('preload-progress', { current: total, total, name: `Preloaded ${loaded}/${total} (memory limit reached)` })
+        return { loaded, total }
+      }
+
+      try {
+        const rawData = getTextureRawData(tex.name, { width: tex.w, height: tex.h, mips: tex.mips, format: tex.fmt })
+        if (rawData) {
+          const rgbaPixels = decodeBCn(rawData, tex.w, tex.h, tex.fmt)
+          texturePreviewCache.set(tex.name, {
+            name: tex.name,
+            width: tex.w,
+            height: tex.h,
+            mips: tex.mips,
+            dxgiFormat: tex.fmt,
+            dxgiFormatName: dxgiName(tex.fmt),
+            rgbaPixels,
+          })
+          previewCacheBytes += tex.w * tex.h * 4
+        }
+      } catch (e) {
+        console.warn('Preload skip:', tex.name, e)
+      }
+      loaded++
+
+      // Time-based progress throttle (~150ms) + always send on last item
+      const now = Date.now()
+      if (now - lastProgressTime >= 150 || loaded === total) {
+        lastProgressTime = now
+        mainWindow?.webContents.send('preload-progress', { current: loaded, total, name: `Preloading textures... ${loaded}/${total}` })
+      }
+
+      // Yield event loop every 5 textures to keep UI responsive
+      if (loaded % 5 === 0) await new Promise(r => setTimeout(r, 0))
+    }
+
+    return { loaded, total }
+  })
+
   ipcMain.handle('asset:extract', async (_e, name: string, outputDir: string) => {
     if (!isString(name) || !isString(outputDir) || !currentParser) return false
 
@@ -583,16 +686,30 @@ function setupIPC() {
         return true
       }
 
-      // Try blobs/gpu/sounds
+      // Try blobs/gpu/sounds - look up blobType for proper extension
+      let blobType = -1
+      let storedSize = 0
+      for (const typeName of ['BLP::BlobEntry', 'BLP::GpuBufferEntry', 'BLP::SoundBankEntry']) {
+        for (const a of currentParser.iterEntriesByType(typeName)) {
+          const o = currentParser.deserializeAlloc(a)
+          if (o.m_Name === name) {
+            storedSize = (o.m_nSize as number) || 0
+            if (typeName === 'BLP::BlobEntry') blobType = (o.m_nBlobType as number) ?? -1
+            break
+          }
+        }
+        if (storedSize > 0) break
+      }
+
       const civbigPath = sdIndex.get(name)
       if (civbigPath) {
         const { data } = readCivbig(civbigPath)
         let finalData = data
         if (OodleDecompressor.isOodleCompressed(data) && oodle) {
-          const raw = oodle.decompress(data, data.length * 4) // estimate
+          const raw = oodle.decompress(data, storedSize || data.length * 4)
           if (raw) finalData = raw
         }
-        const ext = blobExtension(finalData, -1)
+        const ext = blobExtension(finalData, blobType)
         const safeName = name.replace(/[/\\]/g, '_')
         const outPath = join(outputDir, `${safeName}${ext}`)
         writeFileSync(outPath, finalData)
@@ -1424,6 +1541,344 @@ function setupIPC() {
     }
 
     return { error: 'Texture not found' }
+  })
+
+  // ---- Generate texture thumbnails ----
+  ipcMain.handle('asset:thumbnails', async (_e, names: string[]) => {
+    if (!Array.isArray(names) || !currentParser) return {}
+
+    const THUMB = 64
+    const results: Record<string, { width: number; height: number; rgbaPixels: Uint8Array }> = {}
+
+    for (const name of names) {
+      try {
+        for (const alloc of currentParser.iterEntriesByType('BLP::TextureEntry')) {
+          const obj = currentParser.deserializeAlloc(alloc)
+          if (obj.m_Name !== name) continue
+
+          const w = (obj.m_nWidth as number) || 0
+          const h = (obj.m_nHeight as number) || 0
+          const mips = (obj.m_nMips as number) || 1
+          const fmt = (obj.m_eFormat as number) || 0
+
+          const rawData = getTextureRawData(name, { width: w, height: h, mips, format: fmt })
+          if (!rawData) break
+
+          const rgba = decodeBCn(rawData, w, h, fmt)
+
+          // Downscale to thumbnail (nearest-neighbor, preserve aspect ratio)
+          const scale = Math.min(THUMB / w, THUMB / h, 1)
+          const tw = Math.max(1, Math.round(w * scale))
+          const th = Math.max(1, Math.round(h * scale))
+          if (tw === w && th === h) {
+            results[name] = { width: w, height: h, rgbaPixels: rgba }
+          } else {
+            const out = new Uint8Array(tw * th * 4)
+            for (let y = 0; y < th; y++) {
+              for (let x = 0; x < tw; x++) {
+                const sx = Math.floor(x * w / tw)
+                const sy = Math.floor(y * h / th)
+                const si = (sy * w + sx) * 4
+                const di = (y * tw + x) * 4
+                out[di] = rgba[si]; out[di + 1] = rgba[si + 1]; out[di + 2] = rgba[si + 2]; out[di + 3] = rgba[si + 3]
+              }
+            }
+            results[name] = { width: tw, height: th, rgbaPixels: out }
+          }
+          break
+        }
+      } catch {
+        // Skip failed thumbnails
+      }
+    }
+
+    return results
+  })
+
+  // ---- Batch export textures as PNG/JPG ----
+  ipcMain.handle('asset:export-textures-batch', async (_e, names: string[], outputDir: string, format: string, quality?: number) => {
+    if (!Array.isArray(names) || !isString(outputDir) || !currentParser) return { success: 0, failed: 0 }
+    if (format !== 'png' && format !== 'jpg') return { success: 0, failed: 0 }
+    if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true })
+
+    let success = 0, failed = 0
+    const total = names.length
+
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i]
+      mainWindow?.webContents.send('progress', { current: i + 1, total, name })
+
+      try {
+        // Find texture entry
+        let found = false
+        for (const alloc of currentParser.iterEntriesByType('BLP::TextureEntry')) {
+          const obj = currentParser.deserializeAlloc(alloc)
+          if (obj.m_Name !== name) continue
+          found = true
+
+          const w = (obj.m_nWidth as number) || 0
+          const h = (obj.m_nHeight as number) || 0
+          const mips = (obj.m_nMips as number) || 1
+          const fmt = (obj.m_eFormat as number) || 0
+
+          const rawData = getTextureRawData(name, { width: w, height: h, mips, format: fmt })
+          if (!rawData) { failed++; break }
+
+          const rgbaPixels = decodeBCn(rawData, w, h, fmt)
+          const bgraPixels = Buffer.from(rgbaPixels)
+          for (let j = 0; j < bgraPixels.length; j += 4) {
+            const r = bgraPixels[j]
+            bgraPixels[j] = bgraPixels[j + 2]
+            bgraPixels[j + 2] = r
+          }
+          const img = nativeImage.createFromBitmap(bgraPixels, { width: w, height: h })
+          const outData = format === 'jpg' ? img.toJPEG(quality || 90) : img.toPNG()
+          const safeName = name.replace(/[/\\]/g, '_')
+          const ext = format === 'jpg' ? '.jpg' : '.png'
+          writeFileSync(join(outputDir, safeName + ext), outData)
+          success++
+          break
+        }
+        if (!found) failed++
+      } catch {
+        failed++
+      }
+    }
+
+    mainWindow?.webContents.send('progress', null)
+    return { success, failed }
+  })
+
+  // ---- Export BLP Manifest as JSON ----
+  ipcMain.handle('blp:export-manifest', async (_e, manifestJson: string, defaultFilename: string) => {
+    if (!mainWindow || typeof manifestJson !== 'string') return null
+
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export BLP Manifest',
+      defaultPath: defaultFilename,
+      filters: [
+        { name: 'JSON Files', extensions: ['json'] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+    })
+    if (result.canceled || !result.filePath) return null
+
+    writeFileSync(result.filePath, manifestJson, 'utf-8')
+    return { filepath: result.filePath, size: Buffer.byteLength(manifestJson, 'utf-8') }
+  })
+
+  // ---- Export .dep file ----
+  ipcMain.handle('blp:export-dep', async (_e, modId: string, defaultFilename: string) => {
+    if (!mainWindow || typeof modId !== 'string') return null
+
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export .dep File',
+      defaultPath: defaultFilename,
+      filters: [
+        { name: 'DEP Files', extensions: ['dep'] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+    })
+    if (result.canceled || !result.filePath) return null
+
+    const depXml = generateDep(modId)
+    writeFileSync(result.filePath, depXml, 'utf-8')
+    return { filepath: result.filePath, size: Buffer.byteLength(depXml, 'utf-8') }
+  })
+
+  // ---- Get generated text (no save dialog) ----
+  ipcMain.handle('blp:get-dep-text', async (_e, modId: string) => {
+    if (typeof modId !== 'string') return null
+    return generateDep(modId)
+  })
+
+  ipcMain.handle('blp:get-modinfo-text', async (_e, modId: string, modName: string) => {
+    if (typeof modId !== 'string' || typeof modName !== 'string') return null
+    return generateModinfo(modId, modName)
+  })
+
+  // ---- Save text to file (generic) ----
+  ipcMain.handle('blp:save-text-file', async (_e, text: string, defaultFilename: string, filterName: string, filterExt: string) => {
+    if (!mainWindow || typeof text !== 'string') return null
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: `Save ${filterName}`,
+      defaultPath: defaultFilename,
+      filters: [
+        { name: filterName, extensions: [filterExt] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+    })
+    if (result.canceled || !result.filePath) return null
+    writeFileSync(result.filePath, text, 'utf-8')
+    return { filepath: result.filePath, size: Buffer.byteLength(text, 'utf-8') }
+  })
+
+  // ---- Wwise SoundBank parsing ----
+  ipcMain.handle('asset:parse-wwise', async (_e, name: string) => {
+    if (!isString(name) || !currentParser) return null
+
+    const civbigPath = sdIndex.get(name)
+    if (!civbigPath) return null
+
+    try {
+      const { data } = readCivbig(civbigPath)
+      let finalData = data
+      if (OodleDecompressor.isOodleCompressed(data) && oodle) {
+        // Get stored size for decompression
+        let storedSize = 0
+        for (const alloc of currentParser.iterEntriesByType('BLP::SoundBankEntry')) {
+          const obj = currentParser.deserializeAlloc(alloc)
+          if (obj.m_Name === name) {
+            storedSize = (obj.m_nSize as number) || 0
+            break
+          }
+        }
+        const raw = oodle.decompress(data, storedSize || data.length * 4)
+        if (raw) finalData = raw
+      }
+
+      const info = parseWwiseBank(finalData)
+      return {
+        bankVersion: info.bankVersion,
+        bankId: info.bankId,
+        embeddedFiles: info.embeddedFiles.map(f => ({ id: f.id, size: f.size })),
+      }
+    } catch (e) {
+      console.error(`Failed to parse Wwise bank ${name}:`, e)
+      return null
+    }
+  })
+
+  // ---- Extract single .wem from Wwise SoundBank ----
+  ipcMain.handle('asset:extract-wwise-audio', async (_e, name: string, fileId: number) => {
+    if (!isString(name) || typeof fileId !== 'number' || !currentParser) return null
+
+    const civbigPath = sdIndex.get(name)
+    if (!civbigPath) return null
+
+    try {
+      const { data } = readCivbig(civbigPath)
+      let finalData = data
+      if (OodleDecompressor.isOodleCompressed(data) && oodle) {
+        let storedSize = 0
+        for (const alloc of currentParser.iterEntriesByType('BLP::SoundBankEntry')) {
+          const obj = currentParser.deserializeAlloc(alloc)
+          if (obj.m_Name === name) {
+            storedSize = (obj.m_nSize as number) || 0
+            break
+          }
+        }
+        const raw = oodle.decompress(data, storedSize || data.length * 4)
+        if (raw) finalData = raw
+      }
+
+      const info = parseWwiseBank(finalData)
+      const file = info.embeddedFiles.find(f => f.id === fileId)
+      if (!file) return null
+
+      const wemData = extractWemFile(finalData, file)
+      return { data: wemData, id: file.id }
+    } catch (e) {
+      console.error(`Failed to extract Wwise audio ${fileId} from ${name}:`, e)
+      return null
+    }
+  })
+
+  // ---- Extract all .wem files from Wwise SoundBank ----
+  ipcMain.handle('asset:extract-all-wwise', async (_e, name: string, outputDir: string) => {
+    if (!isString(name) || !isString(outputDir) || !currentParser) return { success: 0, failed: 0 }
+
+    const civbigPath = sdIndex.get(name)
+    if (!civbigPath) return { success: 0, failed: 0 }
+
+    try {
+      const { data } = readCivbig(civbigPath)
+      let finalData = data
+      if (OodleDecompressor.isOodleCompressed(data) && oodle) {
+        let storedSize = 0
+        for (const alloc of currentParser.iterEntriesByType('BLP::SoundBankEntry')) {
+          const obj = currentParser.deserializeAlloc(alloc)
+          if (obj.m_Name === name) {
+            storedSize = (obj.m_nSize as number) || 0
+            break
+          }
+        }
+        const raw = oodle.decompress(data, storedSize || data.length * 4)
+        if (raw) finalData = raw
+      }
+
+      const info = parseWwiseBank(finalData)
+      if (info.embeddedFiles.length === 0) return { success: 0, failed: 0 }
+
+      if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true })
+
+      let success = 0
+      let failed = 0
+      for (const file of info.embeddedFiles) {
+        try {
+          const wemData = extractWemFile(finalData, file)
+          const outPath = join(outputDir, `${file.id}.wem`)
+          writeFileSync(outPath, wemData)
+          success++
+        } catch {
+          failed++
+        }
+      }
+
+      return { success, failed }
+    } catch (e) {
+      console.error(`Failed to extract all Wwise audio from ${name}:`, e)
+      return { success: 0, failed: 0 }
+    }
+  })
+
+  // ---- Extract all blobs of a specific type ----
+  ipcMain.handle('asset:extract-blobs-by-type', async (_e, blobType: number, outputDir: string) => {
+    if (typeof blobType !== 'number' || !isString(outputDir) || !currentParser) return { success: 0, failed: 0 }
+
+    if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true })
+
+    let success = 0
+    let failed = 0
+    const total = [...currentParser.iterEntriesByType('BLP::BlobEntry')].filter(a => {
+      const obj = currentParser!.deserializeAlloc(a)
+      return ((obj.m_nBlobType as number) ?? -1) === blobType
+    }).length
+
+    let current = 0
+    for (const alloc of currentParser.iterEntriesByType('BLP::BlobEntry')) {
+      const obj = currentParser.deserializeAlloc(alloc)
+      const type = (obj.m_nBlobType as number) ?? -1
+      if (type !== blobType) continue
+
+      const name = obj.m_Name as string
+      if (!name) continue
+
+      current++
+      mainWindow?.webContents.send('progress', { current, total, name })
+
+      const civbigPath = sdIndex.get(name)
+      if (!civbigPath) { failed++; continue }
+
+      try {
+        const { data } = readCivbig(civbigPath)
+        let finalData = data
+        if (OodleDecompressor.isOodleCompressed(data) && oodle) {
+          const storedSize = (obj.m_nSize as number) || data.length * 4
+          const raw = oodle.decompress(data, storedSize)
+          if (raw) finalData = raw
+        }
+        const ext = blobExtension(finalData, blobType)
+        const safeName = name.replace(/[/\\]/g, '_')
+        writeFileSync(join(outputDir, `${safeName}${ext}`), finalData)
+        success++
+      } catch {
+        failed++
+      }
+    }
+
+    mainWindow?.webContents.send('progress', null)
+    return { success, failed }
   })
 
   // ---- Copy preview image to clipboard as PNG ----

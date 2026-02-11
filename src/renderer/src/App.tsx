@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, DragEvent } from 'react'
+import React, { useState, useCallback, useEffect, useRef, DragEvent } from 'react'
 import { Toolbar } from './components/Toolbar'
 import { AssetTree } from './components/AssetTree'
 import { PreviewPanel } from './components/PreviewPanel'
@@ -11,6 +11,8 @@ import { BatchDDSDialog } from './components/BatchDDSDialog'
 import { AboutDialog } from './components/AboutDialog'
 import { SettingsDialog, SettingsData } from './components/SettingsDialog'
 import { ResizeHandle } from './components/ResizeHandle'
+import { TabBar } from './components/TabBar'
+import { TextPreviewModal } from './components/TextPreviewModal'
 
 // Type declarations for the preload API
 interface AssetEntry {
@@ -43,7 +45,8 @@ interface TexturePreview {
   mips: number
   dxgiFormat: number
   dxgiFormatName: string
-  rgbaPixels: Uint8Array
+  rgbaPixels: Uint8Array | null
+  tooLarge?: boolean
 }
 
 export interface AssetData {
@@ -81,7 +84,7 @@ declare global {
       getStatus: () => Promise<{ oodleLoaded: boolean; sharedDataDirs: number; sharedDataFiles: number; sharedDataPaths: string[]; gameRoot: string | null; gameDetected: boolean; replacementCount: number }>
       openFolder: (folderPath: string) => Promise<void>
       onProgress: (callback: (info: ProgressInfo | null) => void) => () => void
-      getPreferences: () => Promise<{ theme: 'dark' | 'light'; recentFiles: string[]; defaultExportFormat: 'png' | 'jpg'; jpgQuality: number; ddsDefaultBackground: 'checkerboard' | 'black' | 'white'; compressionMode: 'auto' | 'always' | 'never'; experimentalFeatures: boolean }>
+      getPreferences: () => Promise<{ theme: 'dark' | 'light'; recentFiles: string[]; defaultExportFormat: 'png' | 'jpg'; jpgQuality: number; ddsDefaultBackground: 'checkerboard' | 'black' | 'white'; compressionMode: 'auto' | 'always' | 'never'; experimentalFeatures: boolean; preloadTextures: boolean }>
       setTheme: (theme: 'dark' | 'light') => Promise<void>
       updatePreferences: (prefs: Record<string, unknown>) => Promise<void>
       getVersion: () => Promise<string>
@@ -99,9 +102,39 @@ declare global {
       extractTempDds: (name: string) => Promise<string | null>
       exportTextureAsImage: (name: string, format: string, quality?: number) => Promise<{ filepath: string; size: number } | { error: string } | null>
       copyPreviewAsPng: (rgbaPixels: Uint8Array, width: number, height: number) => Promise<boolean>
+      exportManifest: (manifestJson: string, defaultFilename: string) => Promise<{ filepath: string; size: number } | null>
+      exportDep: (modId: string, defaultFilename: string) => Promise<{ filepath: string; size: number } | null>
+      getDepText: (modId: string) => Promise<string | null>
+      getModinfoText: (modId: string, modName: string) => Promise<string | null>
+      saveTextFile: (text: string, defaultFilename: string, filterName: string, filterExt: string) => Promise<{ filepath: string; size: number } | null>
+      parseWwiseBank: (name: string) => Promise<{ bankVersion: number; bankId: number; embeddedFiles: { id: number; size: number }[] } | null>
+      extractWwiseAudio: (name: string, fileId: number) => Promise<{ data: Uint8Array; id: number } | null>
+      extractAllWwiseAudio: (name: string, outputDir: string) => Promise<{ success: number; failed: number }>
+      extractBlobsByType: (blobType: number, outputDir: string) => Promise<{ success: number; failed: number }>
+      exportTexturesBatch: (names: string[], outputDir: string, format: string, quality?: number) => Promise<{ success: number; failed: number }>
+      getThumbnails: (names: string[]) => Promise<Record<string, { width: number; height: number; rgbaPixels: Uint8Array }>>
+      preloadTextures: () => Promise<{ loaded: number; total: number }>
+      onPreloadProgress: (callback: (info: ProgressInfo) => void) => () => void
       onDdsLoadFile: (callback: (filepath: string) => void) => () => void
     }
   }
+}
+
+interface TabState {
+  id: string
+  filepath: string
+  filename: string
+  manifest: BLPManifest | null
+  selectedAsset: AssetEntry | null
+  selectedAssets: Set<string>
+  preview: TexturePreview | null
+  assetData: AssetData | null
+  replacedAssets: Set<string>
+  statusMessage: string
+}
+
+function sanitizeModId(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'blp-studio-mod'
 }
 
 type DdsViewMode = 'viewer' | 'compare'
@@ -109,6 +142,7 @@ type DdsViewMode = 'viewer' | 'compare'
 export default function App() {
   const [manifest, setManifest] = useState<BLPManifest | null>(null)
   const [selectedAsset, setSelectedAsset] = useState<AssetEntry | null>(null)
+  const [selectedAssets, setSelectedAssets] = useState<Set<string>>(new Set())
   const [preview, setPreview] = useState<TexturePreview | null>(null)
   const [assetData, setAssetData] = useState<AssetData | null>(null)
   const [loading, setLoading] = useState(false)
@@ -126,6 +160,7 @@ export default function App() {
   const [isDdsOnlyWindow, setIsDdsOnlyWindow] = useState(false)
   const [showAbout, setShowAbout] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const [textPreview, setTextPreview] = useState<{ title: string; text: string; language: 'json' | 'xml'; defaultFilename: string; filterName: string; filterExt: string } | null>(null)
   const [appVersion, setAppVersion] = useState('1.0.0')
   const [settingsData, setSettingsData] = useState<SettingsData>({
     theme: 'dark',
@@ -134,11 +169,28 @@ export default function App() {
     ddsDefaultBackground: 'checkerboard',
     compressionMode: 'auto',
     experimentalFeatures: false,
+    preloadTextures: false,
   })
+
+  // Keep ref to settings for use in callbacks without dep changes
+  const settingsRef = useRef(settingsData)
+  settingsRef.current = settingsData
 
   // Resizable panel widths
   const [leftPanelWidth, setLeftPanelWidth] = useState(288)   // asset tree (w-72 = 288px)
   const [rightPanelWidth, setRightPanelWidth] = useState(288) // properties panel
+
+  // Multi-tab state
+  const [tabs, setTabs] = useState<TabState[]>([])
+  const [activeTabId, setActiveTabId] = useState<string | null>(null)
+  const tabsRef = useRef<TabState[]>([])
+  tabsRef.current = tabs
+  const currentTabStateRef = useRef<{
+    manifest: BLPManifest | null; selectedAsset: AssetEntry | null; selectedAssets: Set<string>;
+    preview: TexturePreview | null; assetData: AssetData | null; replacedAssets: Set<string>; statusMessage: string
+  }>({ manifest: null, selectedAsset: null, selectedAssets: new Set(), preview: null, assetData: null, replacedAssets: new Set(), statusMessage: '' })
+  // Keep ref in sync with current flat state for tab save/restore
+  currentTabStateRef.current = { manifest, selectedAsset, selectedAssets, preview, assetData, replacedAssets, statusMessage }
 
   const notify = useCallback((type: NotificationData['type'], title: string, message?: string) => {
     setNotification({ type, title, message })
@@ -158,6 +210,7 @@ export default function App() {
         ddsDefaultBackground: prefs.ddsDefaultBackground || 'checkerboard',
         compressionMode: prefs.compressionMode || 'auto',
         experimentalFeatures: prefs.experimentalFeatures === true,
+        preloadTextures: prefs.preloadTextures === true,
       })
     })
     window.electronAPI.getVersion().then(v => setAppVersion(v))
@@ -220,11 +273,115 @@ export default function App() {
     return cleanup
   }, [])
 
+  // Listen for preload-progress events
+  useEffect(() => {
+    const cleanup = window.electronAPI.onPreloadProgress((info) => {
+      setProgress(info.current >= info.total ? null : info)
+    })
+    return cleanup
+  }, [])
+
+  // Tab management helpers
+  const saveActiveTab = useCallback(() => {
+    if (!activeTabId) return
+    const s = currentTabStateRef.current
+    setTabs(prev => prev.map(t => t.id === activeTabId ? {
+      ...t, manifest: s.manifest, selectedAsset: s.selectedAsset, selectedAssets: s.selectedAssets,
+      preview: s.preview, assetData: s.assetData, replacedAssets: s.replacedAssets, statusMessage: s.statusMessage,
+    } : t))
+  }, [activeTabId])
+
+  const loadTabState = useCallback((tab: TabState) => {
+    setManifest(tab.manifest)
+    setSelectedAsset(tab.selectedAsset)
+    setSelectedAssets(tab.selectedAssets)
+    setPreview(tab.preview)
+    setAssetData(tab.assetData)
+    setReplacedAssets(tab.replacedAssets)
+    setStatusMessage(tab.statusMessage)
+  }, [])
+
+  const handleSelectTab = useCallback(async (tabId: string) => {
+    if (tabId === activeTabId) return
+    let targetTab: TabState | undefined
+    const s = currentTabStateRef.current
+    setTabs(prev => {
+      const updated = prev.map(t => {
+        if (t.id === activeTabId) {
+          return { ...t, manifest: s.manifest, selectedAsset: s.selectedAsset, selectedAssets: s.selectedAssets,
+            preview: s.preview, assetData: s.assetData, replacedAssets: s.replacedAssets, statusMessage: s.statusMessage }
+        }
+        return t
+      })
+      targetTab = updated.find(t => t.id === tabId)
+      return updated
+    })
+    if (!targetTab) return
+    // Instantly show cached state
+    loadTabState(targetTab)
+    setActiveTabId(tabId)
+    // Switch parser context in background
+    if (targetTab.filepath) {
+      try { await window.electronAPI.openBLP(targetTab.filepath) } catch { /* cached */ }
+    }
+  }, [activeTabId, loadTabState])
+
+  const handleCloseTab = useCallback(async (tabId: string) => {
+    const tabIndex = tabsRef.current.findIndex(t => t.id === tabId)
+    if (tabIndex === -1) return
+    const remaining = tabsRef.current.filter(t => t.id !== tabId)
+    setTabs(remaining)
+    if (tabId === activeTabId) {
+      if (remaining.length > 0) {
+        const nextTab = remaining[Math.min(tabIndex, remaining.length - 1)]
+        loadTabState(nextTab)
+        setActiveTabId(nextTab.id)
+        if (nextTab.filepath) {
+          try { await window.electronAPI.openBLP(nextTab.filepath) } catch { /* cached */ }
+        }
+      } else {
+        setActiveTabId(null)
+        setManifest(null); setSelectedAsset(null); setSelectedAssets(new Set())
+        setPreview(null); setAssetData(null); setReplacedAssets(new Set())
+        setStatusMessage('Ready. Open a BLP file to begin.')
+      }
+    }
+  }, [activeTabId, loadTabState])
+
+  const handleRenameTab = useCallback((tabId: string, newName: string) => {
+    setTabs(prev => prev.map(t => t.id === tabId ? { ...t, filename: newName } : t))
+  }, [])
+
+  const handleNewTab = useCallback(() => {
+    saveActiveTab()
+    const tabId = Date.now().toString()
+    const newTab: TabState = {
+      id: tabId, filepath: '', filename: 'New Tab',
+      manifest: null, selectedAsset: null, selectedAssets: new Set(),
+      preview: null, assetData: null, replacedAssets: new Set(),
+      statusMessage: 'Ready. Open a BLP file to begin.',
+    }
+    setTabs(prev => [...prev, newTab])
+    setActiveTabId(tabId)
+    setManifest(null); setSelectedAsset(null); setSelectedAssets(new Set())
+    setPreview(null); setAssetData(null); setReplacedAssets(new Set())
+    setStatusMessage('Ready. Open a BLP file to begin.')
+    setDdsData(null)
+  }, [saveActiveTab])
+
   const openBLPFile = useCallback(async (filepath: string) => {
+    // Check if already open in a tab
+    const existingTab = tabsRef.current.find(t => t.filepath === filepath)
+    if (existingTab) {
+      handleSelectTab(existingTab.id)
+      return
+    }
+
     setLoading(true)
     setStatusMessage(`Opening ${filepath.split(/[/\\]/).pop()}...`)
     setProgress({ current: 0, total: 1, name: 'Parsing BLP...' })
     setSelectedAsset(null)
+    setSelectedAssets(new Set())
     setPreview(null)
     setAssetData(null)
     setReplacedAssets(new Set())
@@ -238,8 +395,29 @@ export default function App() {
         setStatusMessage(`Failed to open BLP: ${result.error}`)
         notify('error', 'Failed to open file', result.error as string)
       } else if ('assets' in result) {
-        setManifest(result as BLPManifest)
-        setStatusMessage(`Loaded ${result.filename}: ${(result as BLPManifest).assets.length} assets`)
+        const blpManifest = result as BLPManifest
+        setManifest(blpManifest)
+        const msg = `Loaded ${blpManifest.filename}: ${blpManifest.assets.length} assets`
+        setStatusMessage(msg)
+        // Reuse empty active tab, or create a new one
+        const activeTab = tabsRef.current.find(t => t.id === activeTabId)
+        if (activeTab && !activeTab.filepath) {
+          setTabs(prev => prev.map(t => t.id === activeTabId ? {
+            ...t, filepath, filename: blpManifest.filename,
+            manifest: blpManifest, selectedAsset: null, selectedAssets: new Set(),
+            preview: null, assetData: null, replacedAssets: new Set(), statusMessage: msg,
+          } : t))
+        } else {
+          saveActiveTab()
+          const tabId = Date.now().toString()
+          const newTab: TabState = {
+            id: tabId, filepath, filename: blpManifest.filename,
+            manifest: blpManifest, selectedAsset: null, selectedAssets: new Set(),
+            preview: null, assetData: null, replacedAssets: new Set(), statusMessage: msg,
+          }
+          setTabs(prev => [...prev, newTab])
+          setActiveTabId(tabId)
+        }
         // Fetch shared data paths, game detection, backup count
         try {
           const status = await window.electronAPI.getStatus()
@@ -248,6 +426,10 @@ export default function App() {
           const bkCount = await window.electronAPI.getBackupCount()
           setBackupCount(bkCount)
         } catch { /* ignore */ }
+        // Preload all textures in background if setting enabled
+        if (settingsRef.current.preloadTextures && blpManifest.sharedDataCount > 0 && blpManifest.oodleLoaded) {
+          window.electronAPI.preloadTextures().catch(e => console.warn('Preload failed:', e))
+        }
       }
     } catch (err) {
       setStatusMessage(`Error: ${err}`)
@@ -256,7 +438,7 @@ export default function App() {
       setLoading(false)
       setProgress(null)
     }
-  }, [notify])
+  }, [notify, handleSelectTab, saveActiveTab, activeTabId])
 
   const handleOpen = useCallback(async () => {
     const filepath = await window.electronAPI.selectFile([
@@ -316,7 +498,7 @@ export default function App() {
 
   // Context menu: copy preview image to clipboard
   const handleCopyPreviewAsPng = useCallback(async () => {
-    if (!preview) return
+    if (!preview || !preview.rgbaPixels) return
     try {
       const ok = await window.electronAPI.copyPreviewAsPng(
         new Uint8Array(preview.rgbaPixels), preview.width, preview.height
@@ -330,6 +512,80 @@ export default function App() {
       notify('error', 'Copy failed', String(e))
     }
   }, [preview, notify])
+
+  // Multi-select: selection change from AssetTree
+  const handleSelectionChange = useCallback((newSelection: Set<string>) => {
+    setSelectedAssets(newSelection)
+  }, [])
+
+  // Multi-select: bulk export selected textures
+  const handleExportSelected = useCallback(async (names: string[], format: 'png' | 'jpg') => {
+    if (names.length === 0) return
+    const outputDir = await window.electronAPI.selectDirectory()
+    if (!outputDir) return
+
+    setLoading(true)
+    setStatusMessage(`Exporting ${names.length} textures as ${format.toUpperCase()}...`)
+    try {
+      const result = await window.electronAPI.exportTexturesBatch(names, outputDir, format)
+      if (result.success > 0) {
+        notify('success', 'Batch export complete', `${result.success} textures exported`)
+      }
+      setStatusMessage(`Exported ${result.success} of ${names.length} textures${result.failed > 0 ? `, ${result.failed} failed` : ''}`)
+    } catch (err) {
+      notify('error', 'Batch export failed', String(err))
+      setStatusMessage(`Export error: ${err}`)
+    } finally {
+      setLoading(false)
+    }
+  }, [notify])
+
+  // Show manifest as text preview
+  const handleExportManifest = useCallback(() => {
+    if (!manifest) return
+    const exportData = {
+      filename: manifest.filename,
+      filepath: manifest.filepath,
+      header: manifest.header,
+      typeCounts: manifest.typeCounts,
+      totalAssets: manifest.assets.length,
+      assets: manifest.assets.map(a => ({ name: a.name, type: a.type, ...a.metadata })),
+      exportedAt: new Date().toISOString(),
+      exportedBy: 'BLP Studio',
+    }
+    const json = JSON.stringify(exportData, null, 2)
+    const defaultFilename = manifest.filename.replace(/\.blp$/i, '') + '-manifest.json'
+    setTextPreview({
+      title: `Manifest: ${manifest.filename}`,
+      text: json,
+      language: 'json',
+      defaultFilename,
+      filterName: 'JSON Files',
+      filterExt: 'json',
+    })
+  }, [manifest])
+
+  // Show .dep as text preview
+  const handleExportDep = useCallback(async () => {
+    if (!manifest) return
+    const modId = sanitizeModId(manifest.filename.replace(/\.blp$/i, ''))
+    const defaultFilename = manifest.filename.replace(/\.blp$/i, '') + '.dep'
+    try {
+      const depText = await window.electronAPI.getDepText(modId)
+      if (depText) {
+        setTextPreview({
+          title: `.dep: ${defaultFilename}`,
+          text: depText,
+          language: 'xml',
+          defaultFilename,
+          filterName: 'DEP Files',
+          filterExt: 'dep',
+        })
+      }
+    } catch (e) {
+      notify('error', 'Failed to generate .dep', String(e))
+    }
+  }, [manifest, notify])
 
   // Listen for menu events from main process
   useEffect(() => {
@@ -609,7 +865,10 @@ export default function App() {
             <AssetTree
               assets={manifest?.assets || []}
               selectedAsset={selectedAsset}
+              selectedAssets={selectedAssets}
               onSelectAsset={handleSelectAsset}
+              onSelectionChange={handleSelectionChange}
+              onExportSelected={handleExportSelected}
               replacedAssets={replacedAssets}
               onOpenInDdsViewer={handleOpenInDdsViewer}
               onExportAsImage={handleExportTextureAsImage}
@@ -688,6 +947,8 @@ export default function App() {
       <Toolbar
         onOpen={handleOpen}
         onExtractAll={handleExtractAll}
+        onExportManifest={handleExportManifest}
+        onExportDep={handleExportDep}
         onSave={handleSave}
         onExportAsMod={handleExportAsMod}
         onInstallToGame={handleInstallToGame}
@@ -703,6 +964,22 @@ export default function App() {
         onShowAbout={() => setShowAbout(true)}
         experimentalEnabled={settingsData.experimentalFeatures}
       />
+
+      {/* Tab bar */}
+      {tabs.length > 0 && (
+        <TabBar
+          tabs={tabs.map(t => ({
+            id: t.id,
+            filename: t.filename,
+            hasModifications: t.id === activeTabId ? replacedAssets.size > 0 : t.replacedAssets.size > 0,
+          }))}
+          activeTabId={activeTabId}
+          onSelectTab={handleSelectTab}
+          onCloseTab={handleCloseTab}
+          onNewTab={handleNewTab}
+          onRenameTab={handleRenameTab}
+        />
+      )}
 
       {/* Main content */}
       {renderMainContent()}
@@ -728,6 +1005,20 @@ export default function App() {
         onClose={() => setShowAbout(false)}
         version={appVersion}
       />
+
+      {/* Text preview modal (Manifest / .dep) */}
+      {textPreview && (
+        <TextPreviewModal
+          title={textPreview.title}
+          text={textPreview.text}
+          language={textPreview.language}
+          defaultFilename={textPreview.defaultFilename}
+          filterName={textPreview.filterName}
+          filterExt={textPreview.filterExt}
+          onClose={() => setTextPreview(null)}
+          onNotify={notify}
+        />
+      )}
 
       {/* Notification toast */}
       <Notification notification={notification} onDismiss={() => setNotification(null)} />

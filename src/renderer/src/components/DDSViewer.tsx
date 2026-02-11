@@ -1,6 +1,8 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react'
+import { flushSync } from 'react-dom'
 import { DDSInfoPanel } from './DDSInfoPanel'
 import { ColorInspector, pickPixel, PickedColor } from './ColorInspector'
+import { MagnifierLoupe } from './MagnifierLoupe'
 
 export interface DDSData {
   filepath: string
@@ -34,6 +36,7 @@ interface DDSViewerProps {
 
 export function DDSViewer({ dds, onClose, onNotify, onCompare, onBatchExport }: DDSViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
   const [zoom, setZoom] = useState(1)
   const [channel, setChannel] = useState<Channel>('rgba')
   const [background, setBackground] = useState<Background>('checkerboard')
@@ -43,8 +46,48 @@ export function DDSViewer({ dds, onClose, onNotify, onCompare, onBatchExport }: 
   const [currentHeight, setCurrentHeight] = useState(dds.height)
   const [loadingMip, setLoadingMip] = useState(false)
   const [showInfo, setShowInfo] = useState(true)
-  const [showGrid, setShowGrid] = useState(false)
+  const [gridSize, setGridSize] = useState(0)
   const [pickedColor, setPickedColor] = useState<PickedColor | null>(null)
+  const [ctrlHeld, setCtrlHeld] = useState(false)
+  const [hoverPixel, setHoverPixel] = useState<{ x: number; y: number } | null>(null)
+  const [canvasRectState, setCanvasRectState] = useState<DOMRect | null>(null)
+  const lastHoverRef = useRef<{ x: number; y: number } | null>(null)
+  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null)
+  const [dragCurrent, setDragCurrent] = useState<{ x: number; y: number } | null>(null)
+
+  // Track Ctrl key for magnifier
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => { if (e.key === 'Control') setCtrlHeld(true) }
+    const up = (e: KeyboardEvent) => { if (e.key === 'Control') setCtrlHeld(false) }
+    const blur = () => setCtrlHeld(false)
+    window.addEventListener('keydown', down)
+    window.addEventListener('keyup', up)
+    window.addEventListener('blur', blur)
+    return () => { window.removeEventListener('keydown', down); window.removeEventListener('keyup', up); window.removeEventListener('blur', blur) }
+  }, [])
+
+  const handleCanvasMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!canvasRef.current || !currentPixels) return
+    const rect = canvasRef.current.getBoundingClientRect()
+    const px = Math.floor((e.clientX - rect.left) / zoom)
+    const py = Math.floor((e.clientY - rect.top) / zoom)
+    if (px >= 0 && py >= 0 && px < currentWidth && py < currentHeight) {
+      if (!lastHoverRef.current || lastHoverRef.current.x !== px || lastHoverRef.current.y !== py) {
+        const next = { x: px, y: py }
+        lastHoverRef.current = next
+        setHoverPixel(next)
+        setCanvasRectState(rect)
+      }
+    } else {
+      if (lastHoverRef.current) { lastHoverRef.current = null; setHoverPixel(null) }
+    }
+    if (dragStart) setDragCurrent({ x: Math.max(0, Math.min(currentWidth - 1, px)), y: Math.max(0, Math.min(currentHeight - 1, py)) })
+  }, [currentPixels, currentWidth, currentHeight, zoom, dragStart])
+
+  const handleCanvasMouseLeave = useCallback(() => {
+    lastHoverRef.current = null
+    setHoverPixel(null)
+  }, [])
 
   // Reset state when dds changes
   useEffect(() => {
@@ -128,13 +171,69 @@ export function DDSViewer({ dds, onClose, onNotify, onCompare, onBatchExport }: 
     setZoom(prev => Math.max(0.1, Math.min(20, prev * delta)))
   }
 
-  const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!canvasRef.current || !currentPixels) return
+  const handleCanvasMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (ctrlHeld || !canvasRef.current || !currentPixels) return
+    e.preventDefault()
     const rect = canvasRef.current.getBoundingClientRect()
     const px = Math.floor((e.clientX - rect.left) / zoom)
     const py = Math.floor((e.clientY - rect.top) / zoom)
-    setPickedColor(pickPixel(currentPixels, currentWidth, px, py))
-  }, [currentPixels, currentWidth, zoom])
+    if (px >= 0 && py >= 0 && px < currentWidth && py < currentHeight) {
+      setDragStart({ x: px, y: py })
+      setDragCurrent({ x: px, y: py })
+    }
+  }, [ctrlHeld, currentPixels, currentWidth, currentHeight, zoom])
+
+  const handleCanvasMouseUp = useCallback(() => {
+    if (!dragStart || !dragCurrent) { setDragStart(null); setDragCurrent(null); return }
+    const dx = Math.abs(dragCurrent.x - dragStart.x)
+    const dy = Math.abs(dragCurrent.y - dragStart.y)
+
+    if (dx > 3 || dy > 3) {
+      const container = scrollRef.current
+      const canvas = canvasRef.current
+      if (container && canvas) {
+        const selW = Math.max(dx, 1)
+        const selH = Math.max(dy, 1)
+        const selX = Math.min(dragStart.x, dragCurrent.x)
+        const selY = Math.min(dragStart.y, dragCurrent.y)
+        const newZoom = Math.min(container.clientWidth / selW, container.clientHeight / selH) * 0.9
+
+        // Force React to render the new zoom synchronously so DOM is updated
+        flushSync(() => {
+          setZoom(newZoom)
+          setDragStart(null)
+          setDragCurrent(null)
+        })
+
+        // Now the canvas has its new size - measure its actual position in the scroll container
+        const containerRect = container.getBoundingClientRect()
+        const canvasRect = canvas.getBoundingClientRect()
+        // Canvas position in scroll-content coordinates
+        const canvasInScrollX = canvasRect.left - containerRect.left + container.scrollLeft
+        const canvasInScrollY = canvasRect.top - containerRect.top + container.scrollTop
+        // Selection center in scroll-content coordinates
+        const selCenterX = canvasInScrollX + (selX + selW / 2) * newZoom
+        const selCenterY = canvasInScrollY + (selY + selH / 2) * newZoom
+        // Scroll to center the selection in the viewport
+        container.scrollLeft = selCenterX - container.clientWidth / 2
+        container.scrollTop = selCenterY - container.clientHeight / 2
+        return
+      }
+    } else {
+      setPickedColor(pickPixel(currentPixels, currentWidth, dragStart.x, dragStart.y))
+    }
+
+    setDragStart(null)
+    setDragCurrent(null)
+  }, [dragStart, dragCurrent, currentPixels, currentWidth])
+
+  // Cancel drag if mouse released outside canvas
+  useEffect(() => {
+    if (!dragStart) return
+    const cancel = () => { setDragStart(null); setDragCurrent(null) }
+    window.addEventListener('mouseup', cancel)
+    return () => window.removeEventListener('mouseup', cancel)
+  }, [dragStart])
 
   const handleExport = useCallback(async (format: 'png' | 'jpg') => {
     try {
@@ -159,11 +258,12 @@ export function DDSViewer({ dds, onClose, onNotify, onCompare, onBatchExport }: 
   }
 
   // Grid overlay style for pixel grid
-  const gridOpacity = zoom >= 8 ? 0.3 : zoom >= 4 ? 0.2 : zoom >= 2 ? 0.12 : 0.06
-  const showGridOverlay = showGrid && zoom >= 1
+  const effectiveGridPx = gridSize * zoom
+  const gridOpacity = effectiveGridPx >= 32 ? 0.5 : effectiveGridPx >= 16 ? 0.4 : effectiveGridPx >= 8 ? 0.35 : 0.3
+  const showGridOverlay = gridSize > 0 && effectiveGridPx >= 4
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col flex-1 min-h-0">
       {/* Toolbar */}
       <div className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 border-b border-gray-700 text-sm shrink-0">
         <span className="text-gray-300 font-medium truncate max-w-[200px]" title={dds.filename}>
@@ -178,7 +278,7 @@ export function DDSViewer({ dds, onClose, onNotify, onCompare, onBatchExport }: 
         <span className="text-gray-600">|</span>
         <span className="text-gray-400">{formatSize(dds.fileSize)}</span>
         <span className="text-gray-600">|</span>
-        <span className="text-gray-400">Zoom: {Math.round(zoom * 100)}%</span>
+        <span className="text-gray-400 cursor-pointer hover:text-gray-200 transition-colors" onClick={() => setZoom(1)} title="Reset zoom to 100%">Zoom: {Math.round(zoom * 100)}%</span>
         {Math.round(zoom * 100) !== 100 && (
           <button
             onClick={() => setZoom(1)}
@@ -267,24 +367,29 @@ export function DDSViewer({ dds, onClose, onNotify, onCompare, onBatchExport }: 
         {/* Zoom controls */}
         <button onClick={() => setZoom(1)} className="text-gray-400 hover:text-gray-200 px-1">1:1</button>
         <button onClick={() => {
-          const container = canvasRef.current?.parentElement
-          if (container && currentWidth > 0) {
-            setZoom(Math.min(container.clientWidth / currentWidth, container.clientHeight / currentHeight) * 0.95)
+          if (scrollRef.current && currentWidth > 0) {
+            setZoom(Math.min(scrollRef.current.clientWidth / currentWidth, scrollRef.current.clientHeight / currentHeight) * 0.95)
           }
         }} className="text-gray-400 hover:text-gray-200 px-1">Fit</button>
 
         <span className="text-gray-600">|</span>
 
-        {/* Grid toggle */}
-        <button
-          onClick={() => setShowGrid(prev => !prev)}
-          className={`px-1.5 py-0.5 rounded transition-colors ${
-            showGrid ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-gray-200 hover:bg-gray-700'
-          }`}
-          title="Pixel grid (visible at 4x+ zoom)"
-        >
-          Grid
-        </button>
+        {/* Grid size */}
+        <div className="flex items-center gap-1">
+          <span className="text-gray-500 mr-1">Grid:</span>
+          <select
+            value={gridSize}
+            onChange={e => setGridSize(Number(e.target.value))}
+            className="bg-gray-700 border border-gray-600 rounded px-1 py-0.5 text-gray-200 text-xs"
+          >
+            <option value={0}>Off</option>
+            <option value={1}>1px</option>
+            <option value={4}>4px</option>
+            <option value={8}>8px</option>
+            <option value={16}>16px</option>
+            <option value={32}>32px</option>
+          </select>
+        </div>
 
         {/* Info panel toggle */}
         <button
@@ -299,25 +404,25 @@ export function DDSViewer({ dds, onClose, onNotify, onCompare, onBatchExport }: 
 
         <div className="flex-1" />
 
-        {/* Compare button */}
-        {onCompare && (
+        {/* Compare button - for later use */}
+        {/* {onCompare && (
           <button
             onClick={onCompare}
             className="px-2 py-0.5 bg-gray-700 hover:bg-gray-600 rounded transition-colors text-gray-200"
           >
             Compare
           </button>
-        )}
+        )} */}
 
-        {/* Batch export button */}
-        {onBatchExport && (
+        {/* Batch export button - for later use */}
+        {/* {onBatchExport && (
           <button
             onClick={onBatchExport}
             className="px-2 py-0.5 bg-gray-700 hover:bg-gray-600 rounded transition-colors text-gray-200"
           >
             Batch
           </button>
-        )}
+        )} */}
 
         {/* Export buttons */}
         <button
@@ -336,42 +441,73 @@ export function DDSViewer({ dds, onClose, onNotify, onCompare, onBatchExport }: 
 
       {/* Canvas + Info Panel */}
       <div className="flex-1 flex overflow-hidden">
-        <div
-          className={`flex-1 overflow-auto${background === 'checkerboard' ? ' checkerboard-bg' : ''}`}
-          style={background !== 'checkerboard' ? bgStyle[background] : undefined}
-          onWheel={handleWheel}
-        >
-          <div style={{
-            minWidth: '100%',
-            minHeight: '100%',
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: 16,
-          }}>
-            <div className="relative" style={{ flexShrink: 0 }}>
-              <canvas
-                ref={canvasRef}
-                onClick={handleCanvasClick}
-                style={{
-                  display: 'block',
-                  width: currentWidth * zoom,
-                  height: currentHeight * zoom,
-                  imageRendering: zoom > 2 ? 'pixelated' : 'auto',
-                  cursor: 'crosshair',
-                }}
-              />
-              {showGridOverlay && (
-                <div style={{
-                  position: 'absolute',
-                  inset: 0,
-                  backgroundSize: `${zoom}px ${zoom}px`,
-                  backgroundImage: `linear-gradient(to right, rgba(255,255,255,${gridOpacity}) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,${gridOpacity}) 1px, transparent 1px)`,
-                  pointerEvents: 'none',
-                  imageRendering: 'pixelated',
-                }} />
-              )}
+        <div className="flex-1 flex flex-col min-h-0">
+          <div
+            ref={scrollRef}
+            className={`flex-1 overflow-auto relative${background === 'checkerboard' ? ' checkerboard-bg' : ''}`}
+            style={background !== 'checkerboard' ? bgStyle[background] : undefined}
+            onWheel={handleWheel}
+          >
+            <div style={{
+              minWidth: '100%',
+              minHeight: '100%',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: 16,
+            }}>
+              <div className="relative" style={{ flexShrink: 0 }}>
+                <canvas
+                  ref={canvasRef}
+                  onMouseDown={handleCanvasMouseDown}
+                  onMouseMove={handleCanvasMouseMove}
+                  onMouseUp={handleCanvasMouseUp}
+                  onMouseLeave={handleCanvasMouseLeave}
+                  style={{
+                    display: 'block',
+                    width: currentWidth * zoom,
+                    height: currentHeight * zoom,
+                    imageRendering: zoom > 2 ? 'pixelated' : 'auto',
+                    cursor: ctrlHeld ? 'none' : 'crosshair',
+                  }}
+                />
+                {showGridOverlay && (
+                  <div style={{
+                    position: 'absolute',
+                    inset: 0,
+                    backgroundSize: `${gridSize * zoom}px ${gridSize * zoom}px`,
+                    backgroundImage: `linear-gradient(to right, rgba(255,255,255,${gridOpacity}) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,${gridOpacity}) 1px, transparent 1px)`,
+                    pointerEvents: 'none',
+                    imageRendering: 'pixelated',
+                  }} />
+                )}
+                {dragStart && dragCurrent && (Math.abs(dragCurrent.x - dragStart.x) > 1 || Math.abs(dragCurrent.y - dragStart.y) > 1) && (
+                  <div style={{
+                    position: 'absolute',
+                    left: Math.min(dragStart.x, dragCurrent.x) * zoom,
+                    top: Math.min(dragStart.y, dragCurrent.y) * zoom,
+                    width: Math.abs(dragCurrent.x - dragStart.x) * zoom,
+                    height: Math.abs(dragCurrent.y - dragStart.y) * zoom,
+                    border: '1.5px solid rgba(59, 130, 246, 0.8)',
+                    backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                    pointerEvents: 'none',
+                  }} />
+                )}
+              </div>
             </div>
+            {/* Magnifier loupe */}
+            {ctrlHeld && hoverPixel && canvasRectState && (
+              <MagnifierLoupe
+                pixels={currentPixels}
+                width={currentWidth}
+                height={currentHeight}
+                mouseX={hoverPixel.x}
+                mouseY={hoverPixel.y}
+                canvasRect={canvasRectState}
+                zoom={zoom}
+                visible={true}
+              />
+            )}
           </div>
         </div>
 
@@ -387,8 +523,8 @@ export function DDSViewer({ dds, onClose, onNotify, onCompare, onBatchExport }: 
         )}
       </div>
 
-      {/* Color inspector */}
-      <ColorInspector color={pickedColor} onClose={() => setPickedColor(null)} />
+      {/* Color inspector bar */}
+      <ColorInspector color={pickedColor} hoverPixel={hoverPixel} />
 
       {/* Info bar */}
       <div className="h-6 bg-gray-800 border-t border-gray-700 flex items-center px-3 text-xs text-gray-400 shrink-0">

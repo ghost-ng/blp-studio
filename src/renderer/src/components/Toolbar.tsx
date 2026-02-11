@@ -7,6 +7,8 @@ interface ToolbarProps {
   onExportAsMod: () => void
   onInstallToGame: () => void
   onRestoreBackups: () => void
+  onExportManifest?: () => void
+  onExportDep?: () => void
   hasFile: boolean
   loading: boolean
   replacementCount?: number
@@ -98,6 +100,8 @@ export function Toolbar({
   onExportAsMod,
   onInstallToGame,
   onRestoreBackups,
+  onExportManifest,
+  onExportDep,
   hasFile,
   loading,
   replacementCount = 0,
@@ -116,7 +120,7 @@ export function Toolbar({
         <button
           onClick={onOpen}
           disabled={loading}
-          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 rounded text-sm font-medium transition-colors"
+          className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 rounded text-sm font-medium transition-colors"
         >
           Open BLP
         </button>
@@ -127,6 +131,26 @@ export function Toolbar({
         >
           Extract All
         </button>
+        {onExportManifest && (
+          <button
+            onClick={onExportManifest}
+            disabled={!hasFile || loading}
+            className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 rounded text-sm font-medium transition-colors"
+            title="Export asset list as JSON"
+          >
+            Manifest
+          </button>
+        )}
+        {onExportDep && (
+          <button
+            onClick={onExportDep}
+            disabled={!hasFile || loading}
+            className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 rounded text-sm font-medium transition-colors"
+            title="Export .dep dependency file"
+          >
+            .dep
+          </button>
+        )}
         {experimentalEnabled && (
           <SaveDropdown
             onInstallToGame={onInstallToGame}

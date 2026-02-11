@@ -82,7 +82,8 @@ export function readCivbig(filepath: string): { data: Buffer; typeFlag: number }
     );
   }
 
-  const data = buf.subarray(dataOffset, dataOffset + dataSize);
+  // Copy the slice so the full file buffer can be GC'd immediately
+  const data = Buffer.from(buf.buffer, buf.byteOffset + dataOffset, dataSize);
   return { data, typeFlag };
 }
 

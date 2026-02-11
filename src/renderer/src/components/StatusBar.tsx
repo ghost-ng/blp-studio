@@ -59,18 +59,26 @@ export function StatusBar({ message, manifest, progress, sharedDataPaths = [], o
   return (
     <div className="h-7 bg-gray-800 border-t border-gray-700 flex items-center px-3 text-xs text-gray-400 shrink-0 relative">
       {/* Progress bar background */}
-      {progress && (
+      {progress && pct > 0 && (
         <div
           className="absolute left-0 top-0 h-full bg-blue-600/25 transition-all duration-150"
           style={{ width: `${pct}%` }}
         />
+      )}
+      {/* Indeterminate loading animation when progress=0 */}
+      {progress && pct === 0 && (
+        <div className="absolute left-0 top-0 h-full w-full overflow-hidden">
+          <div className="h-full w-1/3 bg-blue-500/20 animate-pulse" style={{
+            animation: 'statusbar-slide 1.5s ease-in-out infinite',
+          }} />
+        </div>
       )}
 
       {/* Content (on top of progress bar) */}
       <div className="flex items-center w-full relative z-10">
         {progress ? (
           <span className="truncate flex-1 text-blue-300">
-            {progress.current}/{progress.total} ({pct}%) {progress.name}
+            {progress.total > 1 ? `${progress.current}/${progress.total} (${pct}%) ` : ''}{progress.name}
           </span>
         ) : (
           <span className="truncate flex-1">{message}</span>

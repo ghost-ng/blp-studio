@@ -13,7 +13,8 @@ interface TexturePreview {
   mips: number
   dxgiFormat: number
   dxgiFormatName: string
-  rgbaPixels: Uint8Array
+  rgbaPixels: Uint8Array | null
+  tooLarge?: boolean
 }
 
 interface PropertiesPanelProps {

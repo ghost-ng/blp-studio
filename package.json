@@ -1,6 +1,6 @@
 {
   "name": "blp-studio",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Visual BLP asset editor for Civilization VII modding — browse, preview, replace textures, and export game-ready mod packages",
   "author": "ghost_ng",
   "license": "MIT",
@@ -10,8 +10,8 @@
     "dev": "node scripts/dev.mjs",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
-    "package": "npm run build && electron-builder --win",
-    "package:dir": "npm run build && electron-builder --win --dir",
+    "package": "node scripts/gen-ico.mjs && npm run build && electron-builder --win",
+    "package:dir": "node scripts/gen-ico.mjs && npm run build && electron-builder --win --dir",
     "icons": "node scripts/gen-icon.mjs && node scripts/gen-ico.mjs",
     "cli": "npx tsx scripts/cli.ts"
   },
