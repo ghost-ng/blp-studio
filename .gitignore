@@ -34,6 +34,9 @@ TODO.md
 # Temp files
 nul
 
+# Dev scratch / research files
+dev/
+
 # vgmstream binaries (downloaded at build time)
 resources/vgmstream-cli.exe
 resources/vgmstream-win64.zip
