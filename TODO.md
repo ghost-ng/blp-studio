@@ -37,8 +37,6 @@
 
 ## UI / UX
 
-- [ ] Thumbnail grid view -- show texture thumbnails with sorting/filtering
-- [ ] Multi-tab interface -- open multiple BLP files for comparison / cross-package ops
 - [ ] Keyboard shortcuts -- configurable shortcuts for common operations
 - [ ] Drag-and-drop everywhere -- drag DDS into tree, between packages, to desktop
 - [ ] Resizable / dockable panels -- customizable workspace layouts

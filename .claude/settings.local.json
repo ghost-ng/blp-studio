@@ -6,7 +6,9 @@
       "Bash(\"C:\\\\Users\\\\miguel\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\":*)",
       "Bash(\"C:\\\\Users\\\\miguel\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -m pip install lz4)",
       "Read(//c/Program Files \\(x86\\)/Steam/steamapps/common/**)",
-      "Read(//c/Users/miguel/AppData/Local/Firaxis Games/**)"
+      "Read(//c/Users/miguel/AppData/Local/Firaxis Games/**)",
+      "Bash(cmd /c:*)",
+      "Bash(del:*)"
     ],
     "additionalDirectories": [
       "c:\\Users\\miguel\\AppData\\Local\\Firaxis Games\\Sid Meier's Civilization VII\\blp-work",
