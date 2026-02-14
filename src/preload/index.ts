@@ -69,6 +69,7 @@ export interface ElectronAPI {
   setTheme: (theme: 'dark' | 'light') => Promise<void>
   updatePreferences: (prefs: Record<string, unknown>) => Promise<void>
   getVersion: () => Promise<string>
+  getLogPath: () => Promise<string>
   onMenuOpen: (callback: () => void) => () => void
   onMenuShowSettings: (callback: () => void) => () => void
   onMenuShowAbout: (callback: () => void) => () => void
@@ -128,6 +129,7 @@ const api: ElectronAPI = {
   setTheme: (theme) => ipcRenderer.invoke('pref:set-theme', theme),
   updatePreferences: (prefs) => ipcRenderer.invoke('pref:update', prefs),
   getVersion: () => ipcRenderer.invoke('app:version'),
+  getLogPath: () => ipcRenderer.invoke('app:log-path'),
   onMenuOpen: (callback) => {
     const handler = () => callback()
     ipcRenderer.on('menu:open', handler)

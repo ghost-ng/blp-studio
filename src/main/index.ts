@@ -16,11 +16,10 @@ import { decodeBCn } from '../core/bcn-decoder'
 import { generateModinfo, generateDep, sanitizeModId } from '../core/mod-manifest'
 import { parseWwiseBank, extractWemFile } from '../core/wwise-bank'
 import { initPreferences, loadPreferences, setTheme, updatePreferences, addRecentFile, clearRecentFiles } from '../core/preferences'
+import { initLogger, log, warn, error as logError, getLogPath } from '../core/logger'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, unlinkSync } from 'fs'
 import { execFile } from 'child_process'
 import { randomBytes } from 'crypto'
-
-function ts(): string { return new Date().toISOString().slice(11, 23) }
 
 // ---- App State ----
 let mainWindow: BrowserWindow | null = null
@@ -91,6 +90,7 @@ function getAppIcon(): Electron.NativeImage | undefined {
 
 // ---- Window ----
 function createWindow() {
+  log('Creating main window')
   const icon = getAppIcon()
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -134,6 +134,7 @@ function createWindow() {
 
 // ---- DDS Viewer Window ----
 function createDDSWindow(filepath: string) {
+  log(`Opening DDS viewer window: ${filepath}`)
   const win = new BrowserWindow({
     width: 1000,
     height: 700,
@@ -277,13 +278,13 @@ function initOodle() {
   for (const dllPath of candidates) {
     try {
       oodle = new OodleDecompressor(dllPath)
-      console.log(`Oodle loaded: ${dllPath}`)
+      log(`Oodle loaded: ${dllPath}`)
       return
     } catch (e) {
-      console.warn(`Failed to load Oodle from ${dllPath}:`, e)
+      warn(`Failed to load Oodle from ${dllPath}: ${e}`)
     }
   }
-  console.warn('No Oodle DLL found. Compressed assets will not be decompressible.')
+  warn('No Oodle DLL found. Compressed assets will not be decompressible.')
 }
 
 function initSharedData(blpPath?: string) {
@@ -294,6 +295,7 @@ function initSharedData(blpPath?: string) {
     const root = findGameRootFromPath(blpPath)
     if (root) {
       gameRoot = root
+      log(`Game root detected: ${root}`)
       for (const sd of findAllSharedData(root)) {
         if (!dirs.includes(sd)) dirs.push(sd)
       }
@@ -314,7 +316,7 @@ function initSharedData(blpPath?: string) {
 
   sdDirs = dirs
   sdIndex = buildSharedDataIndex(dirs)
-  console.log(`SHARED_DATA: ${dirs.length} dirs, ${sdIndex.size} files`)
+  log(`SHARED_DATA: ${dirs.length} dirs, ${sdIndex.size} files`)
 }
 
 // ---- Asset helpers ----
@@ -426,7 +428,7 @@ function evictPreloadCache(): boolean {
     for (const tex of cache.values()) freed += tex.sizeBytes
     texturePreloadCache.delete(fp)
     totalPreloadBytes -= freed
-    console.log(`${ts()} [preload] evicted cache for ${fp} (freed ${(freed / 1024 / 1024).toFixed(0)}MB)`)
+    log(`[preload] evicted cache for ${fp} (freed ${(freed / 1024 / 1024).toFixed(0)}MB)`)
     return true
   }
   return false // nothing to evict (all cache belongs to current filepath)
@@ -460,9 +462,10 @@ async function preloadTextures(filepath: string, texInfoSnapshot: Map<string, Te
   }
 
   const total = textures.length
-  if (total === 0) { activePreloads.delete(filepath); return }
+  if (total === 0) { activePreloads.delete(filepath); log(`[preload] ${filepath}: all ${texInfoSnapshot.size} textures already cached`); return }
   let completed = 0
   const tStart = performance.now()
+  log(`[preload] starting ${total} textures for ${filepath}`)
 
   for (const [name, info] of textures) {
     if (jobHandle.abort) break
@@ -499,7 +502,7 @@ async function preloadTextures(filepath: string, texInfoSnapshot: Map<string, Te
 
   activePreloads.delete(filepath)
   const elapsed = performance.now() - tStart
-  console.log(`${ts()} [preload] ${filepath}: ${completed}/${total} textures in ${(elapsed / 1000).toFixed(1)}s (${(totalPreloadBytes / 1024 / 1024).toFixed(0)}MB total cache)`)
+  log(`[preload] ${filepath}: ${completed}/${total} textures in ${(elapsed / 1000).toFixed(1)}s (${(totalPreloadBytes / 1024 / 1024).toFixed(0)}MB total cache)`)
   mainWindow?.webContents.send('preload-progress', { current: total, total })
 }
 
@@ -521,7 +524,7 @@ function getTextureRawData(name: string, metadata: Record<string, unknown>): Buf
       }
       return data
     } catch (e) {
-      console.warn(`Failed to read CIVBIG for ${name}:`, e)
+      warn(`Failed to read CIVBIG for ${name}: ${e}`)
     }
   }
 
@@ -609,6 +612,7 @@ function setupIPC() {
       const cached = parserCache.get(filepath)
       let parser: BLPParser
       if (cached) {
+        log(`[blp:open] cache hit, switching to: ${cached.filename}`)
         parser = cached
         currentParser = parser
         // Only need to update window title and set currentParser
@@ -618,11 +622,15 @@ function setupIPC() {
         initSharedData(filepath)
       } else {
         // Full parse for newly opened files
+        log(`[blp:open] parsing new file: ${filepath}`)
+        const t0 = performance.now()
         parser = new BLPParser(filepath)
         parser.parse()
+        const parseTime = performance.now() - t0
         currentParser = parser
         parserCache.set(filepath, parser)
         replacements.clear()
+        log(`[blp:open] parsed ${parser.filename} in ${parseTime.toFixed(0)}ms`)
 
         // Init SHARED_DATA from BLP path
         initSharedData(filepath)
@@ -637,16 +645,17 @@ function setupIPC() {
 
       const assets = collectAssets(parser)
 
-      // Fire-and-forget background preload of all textures
-      const texSnapshot = new Map(textureIndex)
-      preloadTextures(filepath, texSnapshot).catch(e => {
-        console.error('Texture preload failed:', e)
-      })
-
       const typeCounts: Record<string, number> = {}
       for (const a of assets) {
         typeCounts[a.type] = (typeCounts[a.type] || 0) + 1
       }
+      log(`[blp:open] ${assets.length} assets (${typeCounts['texture'] || 0} textures, ${typeCounts['blob'] || 0} blobs, ${typeCounts['gpu'] || 0} gpu, ${typeCounts['sound'] || 0} sounds)`)
+
+      // Fire-and-forget background preload of all textures
+      const texSnapshot = new Map(textureIndex)
+      preloadTextures(filepath, texSnapshot).catch(e => {
+        logError('Texture preload failed', e)
+      })
 
       return {
         filename: parser.filename,
@@ -667,8 +676,7 @@ function setupIPC() {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       const stack = e instanceof Error ? e.stack : undefined
-      console.error('Failed to parse BLP:', msg)
-      if (stack) console.error(stack)
+      logError(`Failed to parse BLP: ${msg}${stack ? '\n' + stack : ''}`)
       return { error: msg }
     }
   })
@@ -681,10 +689,13 @@ function setupIPC() {
     const job = activePreloads.get(filepath)
     if (job) job.abort = true
     const cache = texturePreloadCache.get(filepath)
+    let freedMB = 0
     if (cache) {
       for (const tex of cache.values()) totalPreloadBytes -= tex.sizeBytes
+      freedMB = [...cache.values()].reduce((s, t) => s + t.sizeBytes, 0) / 1024 / 1024
       texturePreloadCache.delete(filepath)
     }
+    log(`[blp:close-cache] closed ${filepath} (freed ${freedMB.toFixed(0)}MB, ${totalPreloadBytes / 1024 / 1024 | 0}MB remaining)`)
   })
 
   ipcMain.handle('asset:preview', async (_e, name: string) => {
@@ -725,7 +736,7 @@ function setupIPC() {
       const rgbaPixels = decodeBCn(rawData, w, h, fmt)
       const t2 = performance.now()
 
-      console.log(`${ts()} [preview-ipc] ${name}: read=${(t1-t0).toFixed(0)}ms, decode=${(t2-t1).toFixed(0)}ms, total=${(t2-tStart).toFixed(0)}ms (${w}x${h} fmt=${fmt}, ${(w*h*4/1024/1024).toFixed(1)}MB)`)
+      log(`[preview-ipc] ${name}: read=${(t1-t0).toFixed(0)}ms, decode=${(t2-t1).toFixed(0)}ms, total=${(t2-tStart).toFixed(0)}ms (${w}x${h} fmt=${fmt}, ${(w*h*4/1024/1024).toFixed(1)}MB)`)
       return {
         name,
         width: w,
@@ -735,13 +746,14 @@ function setupIPC() {
         dxgiFormatName: dxgiName(fmt),
       }
     } catch (e) {
-      console.error(`Failed to decode texture ${name}:`, e)
+      logError(`Failed to decode texture ${name}`, e)
       return null
     }
   })
 
   ipcMain.handle('asset:extract', async (_e, name: string, outputDir: string) => {
     if (!isString(name) || !isString(outputDir) || !currentParser) return false
+    log(`[extract] ${name} -> ${outputDir}`)
 
     try {
       // Find asset type
@@ -797,7 +809,7 @@ function setupIPC() {
         return true
       }
     } catch (e) {
-      console.error(`Failed to extract ${name}:`, e)
+      logError(`Failed to extract ${name}`, e)
     }
 
     return false
@@ -811,6 +823,7 @@ function setupIPC() {
     // Count total assets for progress reporting
     const allAssets = collectAssets(currentParser)
     const total = allAssets.length
+    log(`[extract-all] starting ${total} assets -> ${outputDir}`)
     let current = 0
 
     function sendProgress(name: string) {
@@ -837,7 +850,7 @@ function setupIPC() {
 
       const rawData = getTextureRawData(name, { width: w, height: h, mips, format: fmt })
       if (!rawData) {
-        console.warn(`Texture skip (no data): ${name} w=${w} h=${h} mips=${mips} fmt=${fmt} rawSize=${rawSize} sdPath=${sdIndex.get(name) || 'NONE'} oodleLoaded=${!!oodle}`)
+        warn(`Texture skip (no data): ${name} w=${w} h=${h} mips=${mips} fmt=${fmt} rawSize=${rawSize} sdPath=${sdIndex.get(name) || 'NONE'} oodleLoaded=${!!oodle}`)
         skipped++
         continue
       }
@@ -852,7 +865,7 @@ function setupIPC() {
         writeFileSync(join(texDir, `${safeName}.dds`), Buffer.concat([header, pixelData]))
         success++
       } catch (e) {
-        console.error(`Texture export failed: ${name}`, e)
+        logError(`Texture export failed: ${name}`, e)
         failed++
       }
     }
@@ -894,6 +907,7 @@ function setupIPC() {
     }
 
     mainWindow?.webContents.send('progress', null)
+    log(`[extract-all] done: ${success} ok, ${failed} failed, ${skipped} skipped`)
     return { success, failed, skipped }
   })
 
@@ -956,7 +970,7 @@ function setupIPC() {
         typeFlags,
       }
     } catch (e) {
-      console.error(`Failed to read asset data for ${name}:`, e)
+      logError(`Failed to read asset data for ${name}`, e)
       return null
     }
   })
@@ -964,6 +978,7 @@ function setupIPC() {
   ipcMain.handle('asset:replace', async (_e, name: string) => {
     if (!isString(name) || !currentParser) return null
     if (!mainWindow) return null
+    log(`[replace] opening file dialog for: ${name}`)
 
     // Determine appropriate file filters based on asset type
     let assetType = ''
@@ -1026,7 +1041,7 @@ function setupIPC() {
       }
 
       replacements.set(name, { data, ddsInfo })
-      console.log(`Replacement queued: ${name} (${data.length} bytes)`)
+      log(`Replacement queued: ${name} (${data.length} bytes)`)
       return {
         name,
         size: data.length,
@@ -1034,14 +1049,16 @@ function setupIPC() {
         ddsInfo,
       }
     } catch (e) {
-      console.error(`Failed to read replacement file:`, e)
+      logError('Failed to read replacement file', e)
       return null
     }
   })
 
   ipcMain.handle('asset:clear-replacement', async (_e, name: string) => {
     if (!isString(name)) return false
-    return replacements.delete(name)
+    const removed = replacements.delete(name)
+    if (removed) log(`[replace] cleared replacement: ${name}`)
+    return removed
   })
 
   ipcMain.handle('asset:get-replacements', async () => {
@@ -1054,6 +1071,7 @@ function setupIPC() {
 
   ipcMain.handle('blp:save-replacements', async (_e, outputDir?: string) => {
     if (!currentParser || replacements.size === 0) return { success: 0, failed: 0 }
+    log(`[save] saving ${replacements.size} replacements`)
 
     // If no dir provided, prompt user
     let targetDir = outputDir
@@ -1091,26 +1109,27 @@ function setupIPC() {
           const compressed = oodle.compress(rep.data)
           if (compressed && compressed.length < rep.data.length) {
             writeData = compressed
-            console.log(`  Compressed ${name}: ${rep.data.length} -> ${compressed.length} (${((1 - compressed.length / rep.data.length) * 100).toFixed(1)}% reduction)`)
+            log(`  Compressed ${name}: ${rep.data.length} -> ${compressed.length} (${((1 - compressed.length / rep.data.length) * 100).toFixed(1)}% reduction)`)
           }
         }
 
         writeCivbig(join(sdDir, name), writeData, typeFlag)
         success++
       } catch (e) {
-        console.error(`Failed to write replacement for ${name}:`, e)
+        logError(`Failed to write replacement for ${name}`, e)
         failed++
       }
     }
 
     mainWindow?.webContents.send('progress', null)
-    console.log(`Saved ${success} replacements to ${sdDir}`)
+    log(`Saved ${success} replacements to ${sdDir}`)
     return { success, failed }
   })
 
   // ---- Install to Game: overwrite CIVBIG files in SHARED_DATA with backups ----
   ipcMain.handle('blp:install-to-game', async () => {
     if (!currentParser || replacements.size === 0) return { success: 0, failed: 0, errors: [] }
+    log(`[install] starting install of ${replacements.size} replacements to game`)
 
     let success = 0
     let failed = 0
@@ -1135,7 +1154,7 @@ function setupIPC() {
         const bakPath = origPath + '.blpstudio.bak'
         if (!existsSync(bakPath)) {
           copyFileSync(origPath, bakPath)
-          console.log(`  Backup: ${origPath} -> .bak`)
+          log(`  Backup: ${origPath} -> .bak`)
         }
 
         // Detect original typeFlag and compression
@@ -1148,28 +1167,29 @@ function setupIPC() {
           const compressed = oodle.compress(rep.data)
           if (compressed && compressed.length < rep.data.length) {
             writeData = compressed
-            console.log(`  Compressed ${name}: ${rep.data.length} -> ${compressed.length}`)
+            log(`  Compressed ${name}: ${rep.data.length} -> ${compressed.length}`)
           }
         }
 
         writeCivbig(origPath, writeData, typeFlag)
-        console.log(`  Installed: ${name} (${writeData.length} bytes)`)
+        log(`  Installed: ${name} (${writeData.length} bytes)`)
         success++
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
         errors.push(`${name}: ${msg}`)
-        console.error(`Failed to install ${name}:`, e)
+        logError(`Failed to install ${name}`, e)
         failed++
       }
     }
 
     mainWindow?.webContents.send('progress', null)
-    console.log(`Install to game: ${success} ok, ${failed} failed`)
+    log(`Install to game: ${success} ok, ${failed} failed`)
     return { success, failed, errors }
   })
 
   // ---- Restore Backups: revert all .blpstudio.bak files ----
   ipcMain.handle('blp:restore-backups', async () => {
+    log('[restore] scanning for backups to restore')
     let restored = 0
     let failed = 0
 
@@ -1184,18 +1204,18 @@ function setupIPC() {
             copyFileSync(bakPath, origPath)
             unlinkSync(bakPath)
             restored++
-            console.log(`  Restored: ${origPath}`)
+            log(`  Restored: ${origPath}`)
           } catch (e) {
-            console.error(`Failed to restore ${bakPath}:`, e)
+            logError(`Failed to restore ${bakPath}`, e)
             failed++
           }
         }
       } catch (e) {
-        console.error(`Failed to scan ${dir} for backups:`, e)
+        logError(`Failed to scan ${dir} for backups`, e)
       }
     }
 
-    console.log(`Restore backups: ${restored} restored, ${failed} failed`)
+    log(`Restore backups: ${restored} restored, ${failed} failed`)
     return { restored, failed }
   })
 
@@ -1219,6 +1239,7 @@ function setupIPC() {
   ipcMain.handle('blp:export-as-mod', async () => {
     if (!currentParser || replacements.size === 0) return { success: 0, failed: 0 }
     if (!mainWindow) return { success: 0, failed: 0 }
+    log(`[mod-export] starting mod export with ${replacements.size} replacements`)
 
     const result = await dialog.showOpenDialog(mainWindow, {
       title: 'Select or create a folder for the mod',
@@ -1259,27 +1280,29 @@ function setupIPC() {
           const compressed = oodle.compress(rep.data)
           if (compressed && compressed.length < rep.data.length) {
             writeData = compressed
-            console.log(`  Compressed ${name}: ${rep.data.length} -> ${compressed.length}`)
+            log(`  Compressed ${name}: ${rep.data.length} -> ${compressed.length}`)
           }
         }
 
         writeCivbig(join(sdDir, name), writeData, typeFlag)
         success++
       } catch (e) {
-        console.error(`Failed to write replacement for ${name}:`, e)
+        logError(`Failed to write replacement for ${name}`, e)
         failed++
       }
     }
 
     mainWindow?.webContents.send('progress', null)
-    console.log(`Exported mod "${modId}" to ${modDir}: ${success} assets`)
+    log(`Exported mod "${modId}" to ${modDir}: ${success} assets`)
     return { success, failed, modDir, modId }
   })
 
-  // Log relay: renderer → main process terminal
+  // Log relay: renderer → main process terminal + file
   ipcMain.handle('log:timing', async (_e, msg: string) => {
-    if (typeof msg === 'string') console.log(`${ts()} ${msg}`)
+    if (typeof msg === 'string') log(msg)
   })
+
+  ipcMain.handle('app:log-path', () => getLogPath())
 
 
   ipcMain.handle('app:status', async () => {
@@ -1305,12 +1328,14 @@ function setupIPC() {
 
   ipcMain.handle('pref:set-theme', async (_e, theme: string) => {
     if (theme !== 'dark' && theme !== 'light') return
+    log(`[prefs] theme -> ${theme}`)
     setTheme(theme)
     buildMenu()
   })
 
   ipcMain.handle('pref:update', async (_e, prefs: Record<string, unknown>) => {
     if (!prefs || typeof prefs !== 'object') return
+    log(`[prefs] update: ${Object.keys(prefs).join(', ')}`)
     updatePreferences(prefs as Parameters<typeof updatePreferences>[0])
     // If theme changed, rebuild menu to update label
     if ('theme' in prefs) buildMenu()
@@ -1322,6 +1347,7 @@ function setupIPC() {
 
   // ---- DDS Viewer ----
   ipcMain.handle('dds:open', async (_e, filepath?: string) => {
+    log(`[dds:open] ${filepath || '(file dialog)'}`)
     let ddsPath = filepath
     if (!isString(ddsPath)) {
       if (!mainWindow) return null
@@ -1462,6 +1488,7 @@ function setupIPC() {
     if (!isString(sourceDir) || !isString(outputDir)) {
       return { success: 0, failed: 0, errors: ['Invalid source or output directory'] }
     }
+    log(`[dds:batch-export] ${sourceDir} -> ${outputDir} (${format})`)
     if (format !== 'png' && format !== 'jpg') {
       return { success: 0, failed: 0, errors: ['Invalid format: must be png or jpg'] }
     }
@@ -1593,6 +1620,7 @@ function setupIPC() {
   ipcMain.handle('asset:export-as-image', async (_e, name: string, format: string, quality?: number) => {
     if (!isString(name) || !currentParser || !mainWindow) return null
     if (format !== 'png' && format !== 'jpg') return null
+    log(`[export-image] ${name} as ${format}`)
 
     for (const alloc of currentParser.iterEntriesByType('BLP::TextureEntry')) {
       const obj = currentParser.deserializeAlloc(alloc)
@@ -1641,6 +1669,7 @@ function setupIPC() {
   // Yields the event loop between each texture so protocol responses can flow.
   ipcMain.handle('asset:thumbnails', async (_e, names: string[]) => {
     if (!Array.isArray(names) || !currentParser) return {}
+    log(`[thumbnails] generating ${names.length} thumbnails`)
 
     const THUMB = 64
     const results: Record<string, { width: number; height: number; rgbaPixels: Uint8Array }> = {}
@@ -1700,6 +1729,7 @@ function setupIPC() {
     if (!Array.isArray(names) || !isString(outputDir) || !currentParser) return { success: 0, failed: 0 }
     if (format !== 'png' && format !== 'jpg') return { success: 0, failed: 0 }
     if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true })
+    log(`[export-batch] ${names.length} textures as ${format} -> ${outputDir}`)
 
     let success = 0, failed = 0
     const total = names.length
@@ -1746,12 +1776,14 @@ function setupIPC() {
     }
 
     mainWindow?.webContents.send('progress', null)
+    log(`[export-batch] done: ${success} ok, ${failed} failed`)
     return { success, failed }
   })
 
   // ---- Export BLP Manifest as JSON ----
   ipcMain.handle('blp:export-manifest', async (_e, manifestJson: string, defaultFilename: string) => {
     if (!mainWindow || typeof manifestJson !== 'string') return null
+    log(`[export-manifest] ${defaultFilename}`)
 
     const result = await dialog.showSaveDialog(mainWindow, {
       title: 'Export BLP Manifest',
@@ -1816,6 +1848,7 @@ function setupIPC() {
   // ---- Wwise SoundBank parsing ----
   ipcMain.handle('asset:parse-wwise', async (_e, name: string) => {
     if (!isString(name) || !currentParser) return null
+    log(`[wwise] parsing bank: ${name}`)
 
     const civbigPath = sdIndex.get(name)
     if (!civbigPath) return null
@@ -1844,7 +1877,7 @@ function setupIPC() {
         embeddedFiles: info.embeddedFiles.map(f => ({ id: f.id, size: f.size })),
       }
     } catch (e) {
-      console.error(`Failed to parse Wwise bank ${name}:`, e)
+      logError(`Failed to parse Wwise bank ${name}`, e)
       return null
     }
   })
@@ -1879,7 +1912,7 @@ function setupIPC() {
       const wemData = extractWemFile(finalData, file)
       return { data: wemData, id: file.id }
     } catch (e) {
-      console.error(`Failed to extract Wwise audio ${fileId} from ${name}:`, e)
+      logError(`Failed to extract Wwise audio ${fileId} from ${name}`, e)
       return null
     }
   })
@@ -1887,6 +1920,7 @@ function setupIPC() {
   // ---- Extract all .wem files from Wwise SoundBank ----
   ipcMain.handle('asset:extract-all-wwise', async (_e, name: string, outputDir: string) => {
     if (!isString(name) || !isString(outputDir) || !currentParser) return { success: 0, failed: 0 }
+    log(`[wwise] extracting all audio from ${name} -> ${outputDir}`)
 
     const civbigPath = sdIndex.get(name)
     if (!civbigPath) return { success: 0, failed: 0 }
@@ -1927,7 +1961,7 @@ function setupIPC() {
 
       return { success, failed }
     } catch (e) {
-      console.error(`Failed to extract all Wwise audio from ${name}:`, e)
+      logError(`Failed to extract all Wwise audio from ${name}`, e)
       return { success: 0, failed: 0 }
     }
   })
@@ -1938,9 +1972,10 @@ function setupIPC() {
 
     const vgmstreamPath = findVgmstream()
     if (!vgmstreamPath) {
-      console.warn('vgmstream-cli.exe not found, cannot decode Wwise audio')
+      warn('vgmstream-cli.exe not found, cannot decode Wwise audio')
       return null
     }
+    log(`[audio] decoding ${audioData.length} bytes via vgmstream`)
 
     const id = randomBytes(8).toString('hex')
     const tempIn = join(tmpdir(), `blp-wwise-${id}.wav`)
@@ -1959,7 +1994,7 @@ function setupIPC() {
       const pcmData = readFileSync(tempOut)
       return pcmData
     } catch (e) {
-      console.error('Wwise audio decode failed:', e)
+      logError('Wwise audio decode failed', e)
       return null
     } finally {
       try { unlinkSync(tempIn) } catch { /* ignore */ }
@@ -1970,6 +2005,7 @@ function setupIPC() {
   // ---- Extract all blobs of a specific type ----
   ipcMain.handle('asset:extract-blobs-by-type', async (_e, blobType: number, outputDir: string) => {
     if (typeof blobType !== 'number' || !isString(outputDir) || !currentParser) return { success: 0, failed: 0 }
+    log(`[extract-blobs] type=${blobType} -> ${outputDir}`)
 
     if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true })
 
@@ -2019,6 +2055,7 @@ function setupIPC() {
   // ---- Copy preview image to clipboard as PNG ----
   ipcMain.handle('preview:copy-as-png', async (_e, rgbaPixels: Uint8Array, width: number, height: number) => {
     if (!rgbaPixels || !width || !height) return false
+    log(`[clipboard] copying ${width}x${height} image as PNG`)
 
     try {
       // RGBA → BGRA for nativeImage
@@ -2032,7 +2069,7 @@ function setupIPC() {
       clipboard.writeImage(img)
       return true
     } catch (e) {
-      console.error('Failed to copy image to clipboard:', e)
+      logError('Failed to copy image to clipboard', e)
       return false
     }
   })
@@ -2053,10 +2090,10 @@ app.whenReady().then(() => {
   protocol.handle('blp-preview', async (request) => {
     const name = decodeURIComponent(request.url.replace('blp-preview://', ''))
 
-    if (!currentParser) return new Response('No parser', { status: 404 })
+    if (!currentParser) { warn(`[protocol] request for "${name}" but no parser loaded`); return new Response('No parser', { status: 404 }) }
 
     const info = textureIndex.get(name)
-    if (!info) return new Response('Not found', { status: 404 })
+    if (!info) { warn(`[protocol] texture not found: ${name}`); return new Response('Not found', { status: 404 }) }
 
     const { width, height, mips, format } = info
     const meta = { width, height, mips, dxgiFormat: format, dxgiFormatName: dxgiName(format), tooLarge: false }
@@ -2079,7 +2116,7 @@ app.whenReady().then(() => {
       const header = Buffer.alloc(4)
       header.writeUInt32LE(metaJson.length, 0)
       const body = Buffer.concat([header, metaJson, Buffer.from(cached.rgbaPixels.buffer, cached.rgbaPixels.byteOffset, cached.rgbaPixels.byteLength)])
-      console.log(`${ts()} [preview-cached] ${name}: instant (${width}x${height}, ${(body.length / 1024 / 1024).toFixed(1)}MB)`)
+      log(`[preview-cached] ${name}: instant (${width}x${height}, ${(body.length / 1024 / 1024).toFixed(1)}MB)`)
       return new Response(body, {
         status: 200, headers: { 'Content-Type': 'application/octet-stream' }
       })
@@ -2110,25 +2147,30 @@ app.whenReady().then(() => {
       const header = Buffer.alloc(4)
       header.writeUInt32LE(metaJson.length, 0)
       const body = Buffer.concat([header, metaJson, Buffer.from(rgbaPixels.buffer, rgbaPixels.byteOffset, rgbaPixels.byteLength)])
-      console.log(`${ts()} [preview] ${name}: read=${(t1 - tStart).toFixed(0)}ms, decode=${(t2 - t1).toFixed(0)}ms, total=${(t2 - tStart).toFixed(0)}ms (${width}x${height} fmt=${format}, ${(body.length / 1024 / 1024).toFixed(1)}MB)`)
+      log(`[preview] ${name}: read=${(t1 - tStart).toFixed(0)}ms, decode=${(t2 - t1).toFixed(0)}ms, total=${(t2 - tStart).toFixed(0)}ms (${width}x${height} fmt=${format}, ${(body.length / 1024 / 1024).toFixed(1)}MB)`)
 
       return new Response(body, {
         status: 200, headers: { 'Content-Type': 'application/octet-stream' }
       })
     } catch (e) {
-      console.error(`Failed to decode texture ${name}:`, e)
+      logError(`Failed to decode texture ${name}`, e)
       return new Response('Decode failed', { status: 500 })
     }
   })
 
+  initLogger(app.getPath('userData'))
+  log(`BLP Studio v${app.getVersion()} starting (Electron ${process.versions.electron}, Node ${process.versions.node})`)
+  log(`userData: ${app.getPath('userData')}`)
   initPreferences(app.getPath('userData'))
   initOodle()
   initSharedData()
   setupIPC()
   buildMenu()
   createWindow()
+  log('App ready, main window created')
 })
 
 app.on('window-all-closed', () => {
+  log('All windows closed, quitting')
   app.quit()
 })
