@@ -76,7 +76,7 @@ export function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onNewTab, o
   if (tabs.length === 0) return null
 
   return (
-    <div className="flex items-center bg-gray-800 border-b border-gray-700 text-sm overflow-x-auto shrink-0"
+    <div className="flex items-stretch bg-gray-800 border-b border-gray-700 text-sm overflow-x-auto shrink-0"
          style={{ minHeight: 32 }}>
       {tabs.map(tab => {
         const isActive = tab.id === activeTabId
@@ -129,7 +129,7 @@ export function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab, onNewTab, o
       {onNewTab && (
         <button
           onClick={onNewTab}
-          className="shrink-0 px-2 py-1 text-gray-500 hover:text-gray-200 hover:bg-gray-750 transition-colors"
+          className="shrink-0 px-2 py-1 flex items-center text-gray-500 hover:text-gray-200 hover:bg-gray-750 transition-colors"
           title="New tab"
         >
           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
