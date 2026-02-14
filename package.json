@@ -1,6 +1,6 @@
 {
   "name": "blp-studio",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Visual BLP asset editor for Civilization VII modding — browse, preview, replace textures, and export game-ready mod packages",
   "author": "ghost_ng",
   "license": "MIT",
@@ -55,7 +55,9 @@
       "target": [
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "resources/icon.ico",
