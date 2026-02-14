@@ -33,3 +33,10 @@ TODO.md
 
 # Temp files
 nul
+
+# vgmstream binaries (downloaded at build time)
+resources/vgmstream-cli.exe
+resources/vgmstream-win64.zip
+resources/lib*.dll
+resources/av*.dll
+resources/sw*.dll

@@ -16,7 +16,8 @@ interface TexturePreview {
   mips: number
   dxgiFormat: number
   dxgiFormatName: string
-  rgbaPixels: Uint8Array | null
+  rgbaPixels?: Uint8Array | null  // populated renderer-side via blp-preview:// protocol fetch
+  bitmap?: ImageBitmap | null     // GPU-resident texture for instant display (off V8 heap)
   tooLarge?: boolean
 }
 
@@ -39,6 +40,7 @@ interface PreviewPanelProps {
   isReplaced?: boolean
   onCopyImage?: () => void
   experimentalEnabled?: boolean
+  onPainted?: () => void
 }
 
 interface CanvasContextMenuState {
@@ -81,6 +83,10 @@ function detectSignature(data: Uint8Array): string | null {
   if (ascii4 === 'DDS ') return 'DDS Texture'
   if (u32 === 0x46546C67) return 'glTF Binary'
   if (ascii4 === 'CID0') return 'Compiled ID (material)'
+  if (ascii4 === 'hmu0') return 'Civ7 Heightmap'
+  if (ascii4 === 'IDM0') return 'Civ7 ID Map'
+  if (ascii4 === 'bmu0') return 'Civ7 Blend Mesh'
+  if (ascii4 === 'Root') return 'Civ7 Skeleton'
   if (data[0] === 0x8C) return 'Oodle Kraken (compressed)'
   return null
 }
@@ -94,7 +100,12 @@ const KNOWN_SIGNATURES: [string | number[], string][] = [
   [[0x89, 0x50, 0x4E, 0x47], 'PNG Image'],
   ['DDS ', 'DirectDraw Surface'],
   ['glTF', 'glTF Binary'],
+  ['hmu0', 'Civ7 Heightmap'],
+  ['IDM0', 'Civ7 ID Map'],
+  ['bmu0', 'Civ7 Blend Mesh'],
+  ['Root', 'Civ7 Skeleton (RootNode)'],
   [[0x00, 0x00, 0x00, 0x14], 'Possible FBX fragment'],
+  [[0xB0, 0x6A, 0xB0, 0x6A], 'Civ7 Skeletal Animation'],
 ]
 
 function detectMagic(data: Uint8Array): string | null {
@@ -156,57 +167,149 @@ function parseBlobDetails(data: Uint8Array, blobType: number): Record<string, st
       }
     }
   } else if (blobType === 0 || blobType === 1) {
-    // Heightmap - check if data is float32 grid
-    const totalFloats = Math.floor(data.length / 4)
-    const sqrt = Math.round(Math.sqrt(totalFloats))
-    if (sqrt * sqrt === totalFloats && sqrt > 1) {
-      details['Grid Size'] = `${sqrt} x ${sqrt}`
-      details['Format'] = 'Float32 heightmap'
-    } else {
-      // Try to detect header + payload
-      if (data.length >= 16) {
-        const w = view.getUint32(0, true)
-        const h = view.getUint32(4, true)
-        if (w > 0 && w <= 4096 && h > 0 && h <= 4096) {
-          details['Possible Dims'] = `${w} x ${h}`
-          const payloadFloats = Math.floor((data.length - 8) / 4)
-          if (payloadFloats === w * h) details['Format'] = 'Header(8) + Float32 grid'
+    // Heightmap - hmu0 format: 32B header + uint16 grid
+    // Header: magic(4) + width(4) + height(4) + padding(4) + heightScale(float32) + zeros(12)
+    const magic = String.fromCharCode(data[0], data[1], data[2], data[3])
+    if (magic === 'hmu0' && data.length >= 32) {
+      const w = view.getUint32(4, true)
+      const h = view.getUint32(8, true)
+      const heightScale = view.getFloat32(16, true)
+      details['Format'] = 'hmu0 (uint16 heightmap)'
+      details['Grid Size'] = `${w} x ${h}`
+      if (isFinite(heightScale) && heightScale !== 0) details['Height Scale'] = heightScale.toFixed(4)
+      details['Data Size'] = formatSize(data.length - 32)
+      // Sample height range from uint16 data
+      const gridStart = 32
+      const pixelCount = Math.min(w * h, (data.length - gridStart) / 2)
+      let min = Infinity, max = -Infinity
+      for (let i = 0; i < pixelCount; i++) {
+        const v = view.getUint16(gridStart + i * 2, true)
+        if (v < min) min = v
+        if (v > max) max = v
+      }
+      if (isFinite(min)) {
+        details['Height Range'] = `${min} .. ${max} (uint16)`
+        if (isFinite(heightScale) && heightScale !== 0) {
+          details['World Range'] = `${(min * heightScale).toFixed(2)} .. ${(max * heightScale).toFixed(2)}`
         }
       }
-    }
-    details['Total Values'] = totalFloats.toLocaleString()
-    // Show sample height range from first few values
-    if (data.length >= 16) {
-      let min = Infinity, max = -Infinity
-      const sampleCount = Math.min(totalFloats, 1000)
-      for (let i = 0; i < sampleCount; i++) {
-        const v = view.getFloat32(i * 4, true)
-        if (isFinite(v)) { min = Math.min(min, v); max = Math.max(max, v) }
+    } else {
+      // Fallback: try raw float32 grid
+      const totalFloats = Math.floor(data.length / 4)
+      const sqrt = Math.round(Math.sqrt(totalFloats))
+      if (sqrt * sqrt === totalFloats && sqrt > 1) {
+        details['Grid Size'] = `${sqrt} x ${sqrt}`
+        details['Format'] = 'Float32 heightmap (raw)'
       }
-      if (isFinite(min)) details['Height Range'] = `${min.toFixed(2)} .. ${max.toFixed(2)}`
+      details['Total Values'] = totalFloats.toLocaleString()
+      if (data.length >= 16) {
+        let min = Infinity, max = -Infinity
+        const sampleCount = Math.min(totalFloats, 1000)
+        for (let i = 0; i < sampleCount; i++) {
+          const v = view.getFloat32(i * 4, true)
+          if (isFinite(v)) { min = Math.min(min, v); max = Math.max(max, v) }
+        }
+        if (isFinite(min)) details['Height Range'] = `${min.toFixed(2)} .. ${max.toFixed(2)}`
+      }
     }
   } else if (blobType === 2) {
-    // ID Map
-    const sqrt = Math.round(Math.sqrt(data.length))
-    if (sqrt * sqrt === data.length && sqrt > 1) {
-      details['Grid Size'] = `${sqrt} x ${sqrt}`
+    // ID Map - IDM0 format: magic(4) + width(4) + height(4) + materialCount(4) + palette(materialCount*3) + uint8 grid
+    const magic = String.fromCharCode(data[0], data[1], data[2], data[3])
+    if (magic === 'IDM0' && data.length >= 16) {
+      const w = view.getUint32(4, true)
+      const h = view.getUint32(8, true)
+      const matCount = view.getUint32(12, true)
+      const headerSize = 16 + matCount * 3
+      details['Format'] = 'IDM0 (indexed ID map)'
+      details['Grid Size'] = `${w} x ${h}`
+      details['Material Count'] = matCount.toString()
+      details['Header Size'] = `${headerSize} bytes`
+      // Read palette colors
+      if (matCount > 0 && matCount <= 256 && data.length >= headerSize) {
+        const colors: string[] = []
+        for (let i = 0; i < Math.min(matCount, 8); i++) {
+          const off = 16 + i * 3
+          colors.push(`#${data[off].toString(16).padStart(2, '0')}${data[off + 1].toString(16).padStart(2, '0')}${data[off + 2].toString(16).padStart(2, '0')}`)
+        }
+        details['Palette'] = colors.join(', ') + (matCount > 8 ? '...' : '')
+      }
+      // Count unique IDs in grid
+      if (data.length > headerSize) {
+        const gridData = data.subarray(headerSize)
+        const ids = new Set(gridData.subarray(0, Math.min(gridData.length, 65536)))
+        details['Unique IDs'] = ids.size.toString()
+      }
+    } else {
+      // Fallback: raw uint8 grid
+      const sqrt = Math.round(Math.sqrt(data.length))
+      if (sqrt * sqrt === data.length && sqrt > 1) {
+        details['Grid Size'] = `${sqrt} x ${sqrt}`
+      }
+      const ids = new Set(data.slice(0, Math.min(data.length, 65536)))
+      details['Unique IDs'] = ids.size.toString()
+      details['ID Values'] = Array.from(ids).sort((a, b) => a - b).slice(0, 16).join(', ') + (ids.size > 16 ? '...' : '')
     }
-    const ids = new Set(data.slice(0, Math.min(data.length, 65536)))
-    details['Unique IDs'] = ids.size.toString()
-    details['ID Values'] = Array.from(ids).sort((a, b) => a - b).slice(0, 16).join(', ') + (ids.size > 16 ? '...' : '')
   } else if (blobType === 5) {
-    // Animation
-    if (data.length >= 24) {
-      details['Header[0]'] = '0x' + view.getUint32(0, true).toString(16).toUpperCase()
-      details['Header[1]'] = '0x' + view.getUint32(4, true).toString(16).toUpperCase()
-      const v2 = view.getUint32(8, true)
-      const v3 = view.getUint32(12, true)
-      const v4 = view.getUint32(16, true)
-      if (v2 > 0 && v2 < 1000) details['Track/Bone Count?'] = v2.toString()
-      if (v3 > 0 && v3 < 100000) details['Frame Count?'] = v3.toString()
-      // Check for float duration
-      const dur = view.getFloat32(20, true)
-      if (isFinite(dur) && dur > 0 && dur < 3600) details['Duration?'] = dur.toFixed(3) + 's'
+    // Animation (.anim) - Civ7 skeletal animation format
+    // Magic: B0 6A B0 6A | Two variants: V0 (uncompressed) and V1 (indexed)
+    // Header: 96 bytes, then track data, then ASCII name string at end
+    if (data.length >= 96) {
+      const fps = view.getFloat32(0x08, true)
+      const frameCount = view.getUint32(0x0C, true)
+      const dataOff48 = view.getUint32(0x48, true)
+      const nameOff = view.getUint32(0x50, true)
+      const nameLen = view.getUint32(0x30, true)
+
+      // Read animation name from end of file
+      let animName = ''
+      if (nameOff > 0 && nameOff < data.length) {
+        const end = data.indexOf(0, nameOff)
+        if (end > nameOff) {
+          animName = Array.from(data.slice(nameOff, Math.min(end, nameOff + 128)))
+            .map(b => String.fromCharCode(b)).join('')
+        }
+      }
+
+      const isV0 = dataOff48 === 0xFFFFFFFF // V0: uncompressed raw keyframes
+
+      if (isV0) {
+        // V0: raw keyframe data - 10 floats per bone per frame
+        // [qw, qx, qy, qz, px, py, pz, sx, sy, sz] per bone per frame
+        const boneCount = view.getUint32(0x10, true)
+        const mainDataSize = view.getUint32(0x18, true)
+        const secondarySize = view.getUint32(0x20, true)
+        const duration = fps > 0 ? frameCount / fps : 0
+
+        details['Format'] = 'V0 (uncompressed keyframes)'
+        details['Frame Rate'] = fps.toFixed(0) + ' fps'
+        details['Frame Count'] = frameCount.toLocaleString()
+        if (duration > 0) details['Duration'] = duration.toFixed(2) + 's'
+        details['Bone Count'] = boneCount.toString()
+        details['Encoding'] = '10 float32/bone/frame (quat+pos+scale)'
+        details['Keyframe Data'] = formatSize(mainDataSize)
+        if (secondarySize > 0) details['Bone Index Table'] = formatSize(secondarySize)
+        if (animName) details['Animation Name'] = animName
+      } else {
+        // V1: indexed/compressed with AC11AC11 subheader at offset 0x60
+        const versionField = view.getUint32(0x10, true)
+        const trackDataSize = view.getUint32(0x28, true)
+        const duration = fps > 0 ? frameCount / fps : 0
+
+        // Bone count from data subheader (0x70) or version field low word
+        let boneCount = versionField & 0xFFFF
+        if (data.length >= 0xA0) {
+          const subBoneCount = view.getUint32(0x70, true)
+          if (subBoneCount > 0 && subBoneCount < 10000) boneCount = subBoneCount
+        }
+
+        details['Format'] = 'V1 (indexed tracks)'
+        details['Frame Rate'] = fps.toFixed(0) + ' fps'
+        details['Frame Count'] = frameCount.toLocaleString()
+        if (duration > 0) details['Duration'] = duration.toFixed(2) + 's'
+        details['Bone Count'] = boneCount.toString()
+        details['Track Data'] = formatSize(trackDataSize)
+        if (animName) details['Animation Name'] = animName
+      }
     }
   } else if (blobType === 6) {
     // StateSet (.ssid)
@@ -218,12 +321,27 @@ function parseBlobDetails(data: Uint8Array, blobType: number): Record<string, st
       if (stateCount > 0 && stateCount < 256) details['State Count?'] = stateCount.toString()
     }
   } else if (blobType === 9) {
-    // Blend mesh
-    if (data.length >= 16) {
-      const v0 = view.getUint32(0, true)
-      const v1 = view.getUint32(4, true)
-      if (v0 > 0 && v0 < 1000000) details['Vertex Count?'] = v0.toLocaleString()
-      if (v1 > 0 && v1 < 256) details['Blend Targets?'] = v1.toString()
+    // Blend Mesh - bmu0 format: magic(4) + width(4) + height(4) + padding(4) + uint8 grid
+    const magic = String.fromCharCode(data[0], data[1], data[2], data[3])
+    if (magic === 'bmu0' && data.length >= 16) {
+      const w = view.getUint32(4, true)
+      const h = view.getUint32(8, true)
+      details['Format'] = 'bmu0 (blend mesh grid)'
+      details['Grid Size'] = `${w} x ${h}`
+      details['Data Size'] = formatSize(data.length - 16)
+      // Count unique blend values
+      if (data.length > 16) {
+        const gridData = data.subarray(16)
+        const vals = new Set(gridData.subarray(0, Math.min(gridData.length, 65536)))
+        details['Unique Values'] = vals.size.toString()
+      }
+    } else {
+      if (data.length >= 16) {
+        const v0 = view.getUint32(0, true)
+        const v1 = view.getUint32(4, true)
+        if (v0 > 0 && v0 < 1000000) details['Vertex Count?'] = v0.toLocaleString()
+        if (v1 > 0 && v1 < 256) details['Blend Targets?'] = v1.toString()
+      }
     }
   } else if (blobType === 11) {
     // Mesh
@@ -246,12 +364,25 @@ function parseBlobDetails(data: Uint8Array, blobType: number): Record<string, st
       }
     }
   } else if (blobType === 12) {
-    // Skeleton
-    if (data.length >= 16) {
+    // Skeleton - RootNode format: "RootNode" or "Root" magic, bone data at offset ~256
+    const magic8 = data.length >= 8 ? String.fromCharCode(data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]) : ''
+    const magic4 = String.fromCharCode(data[0], data[1], data[2], data[3])
+    if (magic8.startsWith('RootNode') || magic4 === 'Root') {
+      details['Format'] = 'RootNode skeleton'
+      // Scan for ASCII bone name strings deeper in the file
+      const searchStart = Math.min(128, data.length)
+      const textRange = data.subarray(searchStart, Math.min(data.length, 4096))
+      const textStr = Array.from(textRange).map(b => b >= 0x20 && b < 0x7F ? String.fromCharCode(b) : '\0').join('')
+      const names = textStr.match(/[A-Za-z_][A-Za-z0-9_]{3,}/g)
+      if (names && names.length > 0) {
+        const unique = [...new Set(names)]
+        details['Bone Count'] = unique.length.toString() + ' (approx)'
+        details['Bone Names'] = unique.slice(0, 6).join(', ') + (unique.length > 6 ? '...' : '')
+      }
+    } else if (data.length >= 16) {
       const boneCount = view.getUint32(0, true)
       if (boneCount > 0 && boneCount < 1000) {
         details['Bone Count'] = boneCount.toString()
-        // Try to find bone name strings in the data
         const text = magicAscii(data, Math.min(data.length, 512))
         const names = text.match(/[A-Za-z_][A-Za-z0-9_]{2,}/g)
         if (names && names.length > 0) {
@@ -342,15 +473,62 @@ function HexDump({ data, maxRows = 32 }: { data: Uint8Array; maxRows?: number })
   )
 }
 
-// --- Audio preview (WAV/RIFF) ---
+// --- WAV format detection ---
+const WAV_FORMAT_NAMES: Record<number, string> = {
+  1: 'PCM', 2: 'MS ADPCM', 3: 'IEEE Float', 6: 'A-law', 7: 'mu-law',
+  0x11: 'IMA ADPCM', 0xFFFE: 'Extensible', 0xFFFF: 'Wwise Encoded',
+}
+
+function getWavFormatCode(data: Uint8Array): number | null {
+  if (data.length < 22) return null
+  if (data[0] !== 0x52 || data[1] !== 0x49 || data[2] !== 0x46 || data[3] !== 0x46) return null // RIFF
+  if (data[8] !== 0x57 || data[9] !== 0x41 || data[10] !== 0x56 || data[11] !== 0x45) return null // WAVE
+  if (data[12] !== 0x66 || data[13] !== 0x6D || data[14] !== 0x74 || data[15] !== 0x20) return null // fmt
+  return data[20] | (data[21] << 8)
+}
+
+function isWavPlayable(data: Uint8Array): boolean {
+  const fmt = getWavFormatCode(data)
+  return fmt === 1 || fmt === 3 // PCM or IEEE Float
+}
+
+// --- Audio preview (WAV/RIFF) with Wwise auto-decode ---
 function AudioPreview({ data, name }: { data: Uint8Array; name: string }) {
+  const fmtCode = getWavFormatCode(data)
+  const fmtName = fmtCode !== null ? (WAV_FORMAT_NAMES[fmtCode] || `Unknown (0x${fmtCode.toString(16).toUpperCase()})`) : 'Unknown'
+  const nativePlayable = fmtCode === 1 || fmtCode === 3
+
+  const [decodedData, setDecodedData] = useState<Uint8Array | null>(null)
+  const [decoding, setDecoding] = useState(false)
+  const [decodeError, setDecodeError] = useState(false)
+
+  // Auto-decode Wwise audio via vgmstream
+  useEffect(() => {
+    if (nativePlayable || decodedData || decoding) return
+    setDecoding(true)
+    setDecodeError(false)
+    window.electronAPI.decodeWwiseAudio(data).then(result => {
+      if (result) {
+        setDecodedData(new Uint8Array(result))
+      } else {
+        setDecodeError(true)
+      }
+      setDecoding(false)
+    }).catch(() => {
+      setDecodeError(true)
+      setDecoding(false)
+    })
+  }, [data, nativePlayable])
+
+  const playableData = nativePlayable ? data : decodedData
   const audioUrl = useMemo(() => {
-    const blob = new Blob([data], { type: 'audio/wav' })
+    if (!playableData) return null
+    const blob = new Blob([playableData], { type: 'audio/wav' })
     return URL.createObjectURL(blob)
-  }, [data])
+  }, [playableData])
 
   useEffect(() => {
-    return () => URL.revokeObjectURL(audioUrl)
+    return () => { if (audioUrl) URL.revokeObjectURL(audioUrl) }
   }, [audioUrl])
 
   return (
@@ -359,10 +537,38 @@ function AudioPreview({ data, name }: { data: Uint8Array; name: string }) {
         <span className="text-lg">{'\u{1F3B5}'}</span>
         <span className="font-mono">{name}</span>
       </div>
-      <audio controls className="w-full" src={audioUrl} />
-      <p className="text-xs text-gray-500">
-        Size: {formatSize(data.length)}
-      </p>
+      {decoding ? (
+        <div className="flex items-center gap-2 text-sm text-blue-300">
+          <div className="w-48">
+            <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+              <div className="h-full bg-blue-500 rounded-full" style={{
+                animation: 'progress-slide 1.2s ease-in-out infinite',
+                width: '40%',
+              }} />
+            </div>
+          </div>
+          <span>Decoding {fmtName} audio...</span>
+        </div>
+      ) : audioUrl ? (
+        <audio controls className="w-full" src={audioUrl} />
+      ) : decodeError ? (
+        <div className="text-sm text-gray-400 bg-gray-800 rounded px-3 py-2 border border-gray-700">
+          <span className="text-amber-400">Could not decode audio</span>
+          <span className="text-gray-500 ml-2">({fmtName})</span>
+          <p className="text-xs text-gray-500 mt-1">vgmstream-cli.exe may be missing from resources/. Extract the file to play externally.</p>
+        </div>
+      ) : null}
+      <div className="flex items-center gap-3 text-xs text-gray-500">
+        <span>Size: {formatSize(data.length)}</span>
+        <span>Format: {fmtName}</span>
+        {decodedData && <span className="text-green-400">Decoded to PCM</span>}
+        {data.length >= 28 && fmtCode !== null && (
+          <span>{(data[24] | (data[25] << 8) | (data[26] << 16) | (data[27] << 24))} Hz</span>
+        )}
+        {data.length >= 24 && fmtCode !== null && (
+          <span>{data[22] | (data[23] << 8)} ch</span>
+        )}
+      </div>
     </div>
   )
 }
@@ -587,14 +793,444 @@ function BlobPreview({ data, assetData, selectedAsset }: {
         </div>
       )}
 
-      <HexDump data={data} maxRows={32} />
-      {assetData.truncated && (
-        <p className="text-xs text-gray-500">
-          Showing first {formatSize(data.length)} of {formatSize(assetData.totalSize)}. Extract to view full file.
-        </p>
+      {/* Type-specific visual previews */}
+      {(blobType === 0 || blobType === 1) && (
+        <HeightmapPreview data={data} details={details} />
+      )}
+      {blobType === 2 && (
+        <IDMapPreview data={data} details={details} />
+      )}
+      {blobType === 9 && (
+        <BlendMeshPreview data={data} details={details} />
+      )}
+      {blobType === 5 && details && <AnimationSummary data={data} details={details} />}
+
+      {/* Only show hex dump for non-previewable types that have data */}
+      {!isBlobPreviewable(blobType, data) && (
+        <>
+          <HexDump data={data} maxRows={32} />
+          {assetData.truncated && (
+            <p className="text-xs text-gray-500">
+              Showing first {formatSize(data.length)} of {formatSize(assetData.totalSize)}. Extract to view full file.
+            </p>
+          )}
+        </>
       )}
     </div>
   )
+}
+
+// --- Animation visual summary ---
+function AnimationSummary({ data, details }: { data: Uint8Array; details: Record<string, string> }) {
+  const frameCount = details['Frame Count'] ? parseInt(details['Frame Count'].replace(/,/g, '')) : 0
+  const duration = details['Duration'] ? parseFloat(details['Duration']) : 0
+  const fps = details['Frame Rate'] ? parseFloat(details['Frame Rate']) : 0
+  const boneCount = details['Bone Count'] ? parseInt(details['Bone Count']) : 0
+  const format = details['Format'] || ''
+  const animName = details['Animation Name'] || ''
+
+  return (
+    <div className="space-y-2">
+      {/* Animation name badge */}
+      {animName && (
+        <div className="flex items-center gap-2">
+          <span className="px-2 py-0.5 bg-cyan-900/40 border border-cyan-800/50 rounded text-xs font-mono text-cyan-300">
+            {animName}
+          </span>
+          <span className="text-xs text-gray-600">{format}</span>
+        </div>
+      )}
+
+      {/* Stats row */}
+      <div className="flex items-center gap-3 text-xs">
+        {boneCount > 0 && (
+          <span className="text-gray-400">
+            <span className="text-gray-300 font-medium">{boneCount}</span> bones
+          </span>
+        )}
+        {frameCount > 0 && (
+          <span className="text-gray-400">
+            <span className="text-gray-300 font-medium">{frameCount.toLocaleString()}</span> frames
+          </span>
+        )}
+        {fps > 0 && (
+          <span className="text-gray-400">
+            <span className="text-gray-300 font-medium">{fps.toFixed(0)}</span> fps
+          </span>
+        )}
+        {duration > 0 && (
+          <span className="text-gray-400">
+            <span className="text-gray-300 font-medium">{duration.toFixed(2)}</span>s
+          </span>
+        )}
+      </div>
+
+      {/* Timeline bar */}
+      {frameCount > 0 && (
+        <div className="space-y-1">
+          <div className="flex items-center justify-between text-xs text-gray-500">
+            <span>0</span>
+            <span>{duration > 0 ? `${duration.toFixed(2)}s` : `${frameCount} frames`}</span>
+          </div>
+          <div className="h-3 bg-gray-800 rounded overflow-hidden relative">
+            <div className="absolute inset-0 flex">
+              {Array.from({ length: Math.min(frameCount, 60) }, (_, i) => (
+                <div
+                  key={i}
+                  className="flex-1 border-r border-gray-700"
+                  style={{ opacity: i % 10 === 0 ? 0.8 : 0.3 }}
+                />
+              ))}
+            </div>
+            <div className="absolute inset-0 bg-gradient-to-r from-cyan-600/40 via-blue-600/40 to-purple-600/40 rounded" />
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// --- Heightmap preview (renders hmu0 uint16 or raw float32 grid as grayscale image) ---
+function HeightmapPreview({ data, details }: { data: Uint8Array; details: Record<string, string> | null }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const [zoom, setZoom] = useState(1)
+
+  const gridInfo = useMemo(() => {
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+    const magic = data.length >= 4 ? String.fromCharCode(data[0], data[1], data[2], data[3]) : ''
+
+    // hmu0 format: 32B header + uint16 grid
+    if (magic === 'hmu0' && data.length >= 32) {
+      const w = view.getUint32(4, true)
+      const h = view.getUint32(8, true)
+      if (w > 0 && w <= 4096 && h > 0 && h <= 4096 && data.length >= 32 + w * h * 2) {
+        return { width: w, height: h, offset: 32, format: 'uint16' as const }
+      }
+    }
+    // Fallback: raw float32 sqrt grid
+    const totalFloats = Math.floor(data.length / 4)
+    const sqrt = Math.round(Math.sqrt(totalFloats))
+    if (sqrt * sqrt === totalFloats && sqrt > 1) {
+      return { width: sqrt, height: sqrt, offset: 0, format: 'float32' as const }
+    }
+    return null
+  }, [data])
+
+  useEffect(() => {
+    if (!canvasRef.current || !gridInfo) return
+    const { width, height, offset, format } = gridInfo
+    const canvas = canvasRef.current
+    canvas.width = width
+    canvas.height = height
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+    const imgData = ctx.createImageData(width, height)
+    const pixelCount = width * height
+
+    if (format === 'uint16') {
+      // Find min/max for normalization
+      let min = 65535, max = 0
+      for (let i = 0; i < pixelCount; i++) {
+        const v = view.getUint16(offset + i * 2, true)
+        if (v < min) min = v
+        if (v > max) max = v
+      }
+      const range = max - min || 1
+      for (let i = 0; i < pixelCount; i++) {
+        const v = view.getUint16(offset + i * 2, true)
+        const byte = Math.round(((v - min) / range) * 255)
+        const idx = i * 4
+        imgData.data[idx] = byte
+        imgData.data[idx + 1] = byte
+        imgData.data[idx + 2] = byte
+        imgData.data[idx + 3] = 255
+      }
+    } else {
+      // float32 path
+      let min = Infinity, max = -Infinity
+      for (let i = 0; i < pixelCount; i++) {
+        const v = view.getFloat32(offset + i * 4, true)
+        if (isFinite(v)) { min = Math.min(min, v); max = Math.max(max, v) }
+      }
+      const range = max - min || 1
+      for (let i = 0; i < pixelCount; i++) {
+        const v = view.getFloat32(offset + i * 4, true)
+        const normalized = isFinite(v) ? (v - min) / range : 0
+        const byte = Math.round(normalized * 255)
+        const idx = i * 4
+        imgData.data[idx] = byte
+        imgData.data[idx + 1] = byte
+        imgData.data[idx + 2] = byte
+        imgData.data[idx + 3] = 255
+      }
+    }
+
+    ctx.putImageData(imgData, 0, 0)
+  }, [data, gridInfo])
+
+  if (!gridInfo) return null
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-3 text-xs">
+        <span className="text-gray-400">
+          <span className="text-gray-300 font-medium">{gridInfo.width}x{gridInfo.height}</span> grid
+        </span>
+        <span className="text-gray-500">{gridInfo.format === 'uint16' ? 'uint16' : 'float32'}</span>
+        {details?.['Height Range'] && (
+          <span className="text-gray-400">Range: <span className="text-gray-300 font-mono">{details['Height Range']}</span></span>
+        )}
+        <span className="text-gray-400 cursor-pointer hover:text-gray-200" onClick={() => setZoom(z => z === 1 ? 2 : z === 2 ? 4 : 1)}>
+          Zoom: {Math.round(zoom * 100)}%
+        </span>
+      </div>
+      <div className="overflow-auto max-h-[400px] bg-gray-900 rounded border border-gray-700">
+        <canvas
+          ref={canvasRef}
+          style={{
+            display: 'block',
+            width: gridInfo.width * zoom,
+            height: gridInfo.height * zoom,
+            imageRendering: zoom > 1 ? 'pixelated' : 'auto',
+          }}
+        />
+      </div>
+    </div>
+  )
+}
+
+// --- ID Map preview (renders IDM0 or raw uint8 grid as color-indexed image) ---
+const FALLBACK_COLORS = [
+  [0, 0, 0], [31, 119, 180], [255, 127, 14], [44, 160, 44], [214, 39, 40],
+  [148, 103, 189], [140, 86, 75], [227, 119, 194], [127, 127, 127],
+  [188, 189, 34], [23, 190, 207], [65, 68, 81], [174, 199, 232],
+  [255, 187, 120], [152, 223, 138], [255, 152, 150], [197, 176, 213],
+]
+
+function IDMapPreview({ data, details }: { data: Uint8Array; details: Record<string, string> | null }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const [zoom, setZoom] = useState(1)
+
+  const gridInfo = useMemo(() => {
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+    const magic = data.length >= 4 ? String.fromCharCode(data[0], data[1], data[2], data[3]) : ''
+
+    // IDM0 format: magic(4) + width(4) + height(4) + materialCount(4) + palette(matCount*3) + uint8 grid
+    if (magic === 'IDM0' && data.length >= 16) {
+      const w = view.getUint32(4, true)
+      const h = view.getUint32(8, true)
+      const matCount = view.getUint32(12, true)
+      const headerSize = 16 + matCount * 3
+      if (w > 0 && w <= 4096 && h > 0 && h <= 4096 && matCount <= 256 && data.length >= headerSize + w * h) {
+        // Read embedded RGB palette
+        const palette: [number, number, number][] = []
+        for (let i = 0; i < matCount; i++) {
+          const off = 16 + i * 3
+          palette.push([data[off], data[off + 1], data[off + 2]])
+        }
+        return { width: w, height: h, offset: headerSize, palette }
+      }
+    }
+    // Fallback: raw uint8 square grid
+    const sqrt = Math.round(Math.sqrt(data.length))
+    if (sqrt * sqrt === data.length && sqrt > 1) {
+      return { width: sqrt, height: sqrt, offset: 0, palette: null }
+    }
+    return null
+  }, [data])
+
+  useEffect(() => {
+    if (!canvasRef.current || !gridInfo) return
+    const { width, height, offset, palette } = gridInfo
+    const canvas = canvasRef.current
+    canvas.width = width
+    canvas.height = height
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    const imgData = ctx.createImageData(width, height)
+    for (let i = 0; i < width * height; i++) {
+      const id = data[offset + i]
+      let r: number, g: number, b: number
+      if (palette && id < palette.length) {
+        [r, g, b] = palette[id]
+      } else {
+        [r, g, b] = FALLBACK_COLORS[id % FALLBACK_COLORS.length]
+      }
+      const idx = i * 4
+      imgData.data[idx] = r
+      imgData.data[idx + 1] = g
+      imgData.data[idx + 2] = b
+      imgData.data[idx + 3] = 255
+    }
+    ctx.putImageData(imgData, 0, 0)
+  }, [data, gridInfo])
+
+  if (!gridInfo) return null
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-3 text-xs">
+        <span className="text-gray-400">
+          <span className="text-gray-300 font-medium">{gridInfo.width}x{gridInfo.height}</span> grid
+        </span>
+        {gridInfo.palette && (
+          <span className="text-gray-500">{gridInfo.palette.length} materials</span>
+        )}
+        {details?.['Unique IDs'] && (
+          <span className="text-gray-400"><span className="text-gray-300 font-medium">{details['Unique IDs']}</span> unique IDs</span>
+        )}
+        <span className="text-gray-400 cursor-pointer hover:text-gray-200" onClick={() => setZoom(z => z === 1 ? 2 : z === 2 ? 4 : 1)}>
+          Zoom: {Math.round(zoom * 100)}%
+        </span>
+      </div>
+      {/* Palette swatch row */}
+      {gridInfo.palette && gridInfo.palette.length > 0 && (
+        <div className="flex items-center gap-0.5 flex-wrap">
+          {gridInfo.palette.map(([r, g, b], i) => (
+            <div
+              key={i}
+              title={`Material ${i}: rgb(${r},${g},${b})`}
+              className="w-4 h-4 rounded-sm border border-gray-600"
+              style={{ backgroundColor: `rgb(${r},${g},${b})` }}
+            />
+          ))}
+        </div>
+      )}
+      <div className="overflow-auto max-h-[400px] bg-gray-900 rounded border border-gray-700">
+        <canvas
+          ref={canvasRef}
+          style={{
+            display: 'block',
+            width: gridInfo.width * zoom,
+            height: gridInfo.height * zoom,
+            imageRendering: zoom > 1 ? 'pixelated' : 'auto',
+          }}
+        />
+      </div>
+    </div>
+  )
+}
+
+// --- Blend Mesh preview (renders bmu0 uint8 grid as grayscale image) ---
+function BlendMeshPreview({ data, details }: { data: Uint8Array; details: Record<string, string> | null }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const [zoom, setZoom] = useState(1)
+
+  const gridInfo = useMemo(() => {
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+    const magic = data.length >= 4 ? String.fromCharCode(data[0], data[1], data[2], data[3]) : ''
+
+    // bmu0 format: magic(4) + width(4) + height(4) + padding(4) + uint8 grid
+    if (magic === 'bmu0' && data.length >= 16) {
+      const w = view.getUint32(4, true)
+      const h = view.getUint32(8, true)
+      if (w > 0 && w <= 4096 && h > 0 && h <= 4096 && data.length >= 16 + w * h) {
+        return { width: w, height: h, offset: 16 }
+      }
+    }
+    return null
+  }, [data])
+
+  useEffect(() => {
+    if (!canvasRef.current || !gridInfo) return
+    const { width, height, offset } = gridInfo
+    const canvas = canvasRef.current
+    canvas.width = width
+    canvas.height = height
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    const imgData = ctx.createImageData(width, height)
+    for (let i = 0; i < width * height; i++) {
+      const v = data[offset + i]
+      const idx = i * 4
+      imgData.data[idx] = v
+      imgData.data[idx + 1] = v
+      imgData.data[idx + 2] = v
+      imgData.data[idx + 3] = 255
+    }
+    ctx.putImageData(imgData, 0, 0)
+  }, [data, gridInfo])
+
+  if (!gridInfo) return null
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-3 text-xs">
+        <span className="text-gray-400">
+          <span className="text-gray-300 font-medium">{gridInfo.width}x{gridInfo.height}</span> grid
+        </span>
+        <span className="text-gray-500">uint8 blend weights</span>
+        {details?.['Unique Values'] && (
+          <span className="text-gray-400"><span className="text-gray-300 font-medium">{details['Unique Values']}</span> unique values</span>
+        )}
+        <span className="text-gray-400 cursor-pointer hover:text-gray-200" onClick={() => setZoom(z => z === 1 ? 2 : z === 2 ? 4 : 1)}>
+          Zoom: {Math.round(zoom * 100)}%
+        </span>
+      </div>
+      <div className="overflow-auto max-h-[400px] bg-gray-900 rounded border border-gray-700">
+        <canvas
+          ref={canvasRef}
+          style={{
+            display: 'block',
+            width: gridInfo.width * zoom,
+            height: gridInfo.height * zoom,
+            imageRendering: zoom > 1 ? 'pixelated' : 'auto',
+          }}
+        />
+      </div>
+    </div>
+  )
+}
+
+// --- Determine if a blob type is previewable ---
+function isBlobPreviewable(blobType: number, data: Uint8Array): boolean {
+  const magic = data.length >= 4 ? String.fromCharCode(data[0], data[1], data[2], data[3]) : ''
+
+  // Heightmap - hmu0 or raw float32 grid
+  if (blobType === 0 || blobType === 1) {
+    if (magic === 'hmu0' && data.length >= 32) {
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+      const w = view.getUint32(4, true)
+      const h = view.getUint32(8, true)
+      if (w > 0 && w <= 4096 && h > 0 && h <= 4096 && data.length >= 32 + w * h * 2) return true
+    }
+    const totalFloats = Math.floor(data.length / 4)
+    const sqrt = Math.round(Math.sqrt(totalFloats))
+    if (sqrt * sqrt === totalFloats && sqrt > 1) return true
+    return false
+  }
+  // ID Map - IDM0 or raw uint8 square grid
+  if (blobType === 2) {
+    if (magic === 'IDM0' && data.length >= 16) {
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+      const w = view.getUint32(4, true)
+      const h = view.getUint32(8, true)
+      const matCount = view.getUint32(12, true)
+      const headerSize = 16 + matCount * 3
+      if (w > 0 && w <= 4096 && h > 0 && h <= 4096 && matCount <= 256 && data.length >= headerSize + w * h) return true
+    }
+    const sqrt = Math.round(Math.sqrt(data.length))
+    return sqrt * sqrt === data.length && sqrt > 1
+  }
+  // Blend Mesh - bmu0
+  if (blobType === 9) {
+    if (magic === 'bmu0' && data.length >= 16) {
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+      const w = view.getUint32(4, true)
+      const h = view.getUint32(8, true)
+      if (w > 0 && w <= 4096 && h > 0 && h <= 4096 && data.length >= 16 + w * h) return true
+    }
+    return false
+  }
+  // Animation - always show analysis
+  if (blobType === 5) return true
+  // WAV audio handled upstream
+  if (blobType === 7) return true
+  return false
 }
 
 function ActionButtons({ onExtract, onReplace, onRevert, isReplaced, experimentalEnabled }: {
@@ -640,7 +1276,7 @@ function ActionButtons({ onExtract, onReplace, onRevert, isReplaced, experimenta
   )
 }
 
-export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExtract, onReplace, onRevert, isReplaced, onCopyImage, experimentalEnabled }: PreviewPanelProps) {
+export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExtract, onReplace, onRevert, isReplaced, onCopyImage, experimentalEnabled, onPainted }: PreviewPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const [zoom, setZoom] = useState(1)
@@ -712,8 +1348,11 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
   }, [onCopyImage, preview])
 
   useEffect(() => {
-    if (!preview || !preview.rgbaPixels || !canvasRef.current) return
+    if (!preview || !canvasRef.current) return
+    // Need either bitmap (GPU-resident, from prefetch cache) or rgbaPixels (from direct fetch)
+    if (!preview.bitmap && !preview.rgbaPixels) return
 
+    const t0 = performance.now()
     const canvas = canvasRef.current
     const ctx = canvas.getContext('2d')
     if (!ctx) return
@@ -721,12 +1360,18 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
     canvas.width = preview.width
     canvas.height = preview.height
 
-    const imageData = new ImageData(
-      new Uint8ClampedArray(preview.rgbaPixels.buffer, preview.rgbaPixels.byteOffset, preview.rgbaPixels.byteLength),
-      preview.width,
-      preview.height
-    )
-    ctx.putImageData(imageData, 0, 0)
+    if (preview.bitmap) {
+      // GPU-resident ImageBitmap — instant draw, no V8 heap pressure
+      ctx.drawImage(preview.bitmap, 0, 0)
+    } else if (preview.rgbaPixels) {
+      // Direct pixel data (cache miss / direct fetch path)
+      const imageData = new ImageData(
+        new Uint8ClampedArray(preview.rgbaPixels.buffer, preview.rgbaPixels.byteOffset, preview.rgbaPixels.byteLength),
+        preview.width, preview.height
+      )
+      ctx.putImageData(imageData, 0, 0)
+    }
+    const t1 = performance.now()
 
     // Fit-to-view: scale down so entire texture is visible, cap at 100%
     const container = scrollRef.current
@@ -741,22 +1386,41 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
     } else {
       setZoom(1)
     }
-  }, [preview])
 
-  const handleWheel = (e: React.WheelEvent) => {
-    e.preventDefault()
-    const delta = e.deltaY > 0 ? 0.9 : 1.1
-    setZoom(prev => Math.max(0.1, Math.min(10, prev * delta)))
-  }
+    window.electronAPI?.logTiming(`[canvas] ${preview.name}: ${preview.bitmap ? 'drawImage' : 'putImageData'}=${(t1 - t0).toFixed(0)}ms (${preview.width}x${preview.height})`)
+    onPainted?.()
+  }, [preview, onPainted])
+
+  // Use native event listener with { passive: false } — React registers wheel as passive
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const delta = e.deltaY > 0 ? 0.9 : 1.1
+      setZoom(prev => Math.max(0.1, Math.min(10, prev * delta)))
+    }
+    el.addEventListener('wheel', handleWheel, { passive: false })
+    return () => el.removeEventListener('wheel', handleWheel)
+  }, [])
 
   // Single click: pick color
   const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (ctrlHeld || !canvasRef.current || !preview?.rgbaPixels) return
+    if (ctrlHeld || !canvasRef.current || !preview) return
+    if (!preview.rgbaPixels && !preview.bitmap) return
     const rect = canvasRef.current.getBoundingClientRect()
     const px = Math.floor((e.clientX - rect.left) / zoom)
     const py = Math.floor((e.clientY - rect.top) / zoom)
     if (px >= 0 && py >= 0 && px < preview.width && py < preview.height) {
-      setPickedColor(pickPixel(preview.rgbaPixels, preview.width, px, py))
+      if (preview.rgbaPixels) {
+        setPickedColor(pickPixel(preview.rgbaPixels, preview.width, px, py))
+      } else {
+        const ctx = canvasRef.current.getContext('2d')
+        if (ctx) {
+          const d = ctx.getImageData(px, py, 1, 1).data
+          setPickedColor({ x: px, y: py, r: d[0], g: d[1], b: d[2], a: d[3] })
+        }
+      }
     }
   }, [ctrlHeld, preview, zoom])
 
@@ -808,9 +1472,14 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
   if (loading) {
     return (
       <div className="flex-1 flex items-center justify-center text-gray-400">
-        <div className="text-center">
-          <div className="animate-spin text-2xl mb-2">&#x23F3;</div>
-          <p>Loading preview...</p>
+        <div className="w-64 text-center">
+          <p className="text-sm mb-3">Loading {selectedAsset?.name || 'preview'}...</p>
+          <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+            <div className="h-full bg-blue-500 rounded-full" style={{
+              animation: 'progress-slide 1.2s ease-in-out infinite',
+              width: '40%',
+            }} />
+          </div>
         </div>
       </div>
     )
@@ -838,7 +1507,7 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
     )
   }
 
-  if (selectedAsset.type === 'texture' && preview && preview.rgbaPixels) {
+  if (selectedAsset.type === 'texture' && preview && (preview.rgbaPixels || preview.bitmap)) {
     return (
       <div className="flex-1 flex flex-col">
         <div className="flex items-center gap-2 px-3 py-1.5 bg-gray-850 border-b border-gray-700 text-sm">
@@ -882,7 +1551,6 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
         <div
           ref={scrollRef}
           className="flex-1 overflow-auto checkerboard-bg relative"
-          onWheel={handleWheel}
           onContextMenu={handleCanvasContextMenu}
         >
           <div style={{
@@ -923,7 +1591,7 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
           {/* Magnifier loupe */}
           {ctrlHeld && hoverPixel && canvasRect && (
             <MagnifierLoupe
-              pixels={preview.rgbaPixels}
+              pixels={preview.rgbaPixels || null}
               width={preview.width}
               height={preview.height}
               mouseX={hoverPixel.x}
@@ -931,6 +1599,7 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
               canvasRect={canvasRect}
               zoom={zoom}
               visible={true}
+              sourceCanvas={!preview.rgbaPixels ? canvasRef.current : undefined}
             />
           )}
         </div>

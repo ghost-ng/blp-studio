@@ -30,7 +30,8 @@ export interface TexturePreview {
   mips: number
   dxgiFormat: number
   dxgiFormatName: string
-  rgbaPixels: Uint8Array
+  rgbaPixels?: Uint8Array  // populated renderer-side via blp-preview:// protocol fetch
+  tooLarge?: boolean
 }
 
 export interface ReplacementInfo {
@@ -91,10 +92,12 @@ export interface ElectronAPI {
   extractWwiseAudio: (name: string, fileId: number) => Promise<{ data: Uint8Array; id: number } | null>
   extractAllWwiseAudio: (name: string, outputDir: string) => Promise<{ success: number; failed: number }>
   extractBlobsByType: (blobType: number, outputDir: string) => Promise<{ success: number; failed: number }>
+  decodeWwiseAudio: (audioData: Uint8Array) => Promise<Uint8Array | null>
   exportTexturesBatch: (names: string[], outputDir: string, format: string, quality?: number) => Promise<{ success: number; failed: number }>
   getThumbnails: (names: string[]) => Promise<Record<string, { width: number; height: number; rgbaPixels: Uint8Array }>>
-  preloadTextures: () => Promise<{ loaded: number; total: number }>
-  onPreloadProgress: (callback: (info: ProgressInfo) => void) => () => void
+  closeCache: (filepath: string) => Promise<void>
+  logTiming: (msg: string) => Promise<void>
+  onPreloadProgress: (callback: (info: { current: number; total: number }) => void) => () => void
   onDdsLoadFile: (callback: (filepath: string) => void) => () => void
 }
 
@@ -172,11 +175,13 @@ const api: ElectronAPI = {
   extractWwiseAudio: (name, fileId) => ipcRenderer.invoke('asset:extract-wwise-audio', name, fileId),
   extractAllWwiseAudio: (name, outputDir) => ipcRenderer.invoke('asset:extract-all-wwise', name, outputDir),
   extractBlobsByType: (blobType, outputDir) => ipcRenderer.invoke('asset:extract-blobs-by-type', blobType, outputDir),
+  decodeWwiseAudio: (audioData) => ipcRenderer.invoke('audio:decode-wwise', audioData),
   exportTexturesBatch: (names, outputDir, format, quality?) => ipcRenderer.invoke('asset:export-textures-batch', names, outputDir, format, quality),
   getThumbnails: (names) => ipcRenderer.invoke('asset:thumbnails', names),
-  preloadTextures: () => ipcRenderer.invoke('blp:preload-textures'),
+  closeCache: (filepath) => ipcRenderer.invoke('blp:close-cache', filepath),
+  logTiming: (msg) => ipcRenderer.invoke('log:timing', msg),
   onPreloadProgress: (callback) => {
-    const handler = (_event: Electron.IpcRendererEvent, info: ProgressInfo) => callback(info)
+    const handler = (_event: Electron.IpcRendererEvent, info: { current: number; total: number }) => callback(info)
     ipcRenderer.on('preload-progress', handler)
     return () => ipcRenderer.removeListener('preload-progress', handler)
   },

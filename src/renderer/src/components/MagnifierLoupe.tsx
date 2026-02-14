@@ -1,7 +1,7 @@
 import React, { useRef, useEffect } from 'react'
 
 interface MagnifierLoupeProps {
-  pixels: Uint8Array
+  pixels: Uint8Array | null
   width: number
   height: number
   mouseX: number
@@ -9,23 +9,59 @@ interface MagnifierLoupeProps {
   canvasRect: DOMRect
   zoom: number
   visible: boolean
+  sourceCanvas?: HTMLCanvasElement | null
 }
 
 const LOUPE_RADIUS = 5
 const PIXEL_SIZE = 13
 const LOUPE_SIZE = (LOUPE_RADIUS * 2 + 1) * PIXEL_SIZE // 143px
 
-export function MagnifierLoupe({ pixels, width, height, mouseX, mouseY, canvasRect, zoom, visible }: MagnifierLoupeProps) {
+export function MagnifierLoupe({ pixels, width, height, mouseX, mouseY, canvasRect, zoom, visible, sourceCanvas }: MagnifierLoupeProps) {
   const loupeRef = useRef<HTMLCanvasElement>(null)
 
   useEffect(() => {
     if (!visible || !loupeRef.current) return
+    if (!pixels && !sourceCanvas) return
     const canvas = loupeRef.current
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
     canvas.width = LOUPE_SIZE
     canvas.height = LOUPE_SIZE
+
+    // Read region from source canvas when no direct pixel array (bitmap mode)
+    let regionData: ImageData | null = null
+    if (!pixels && sourceCanvas) {
+      const srcCtx = sourceCanvas.getContext('2d')
+      if (srcCtx) {
+        const rx = Math.max(0, mouseX - LOUPE_RADIUS)
+        const ry = Math.max(0, mouseY - LOUPE_RADIUS)
+        const rw = Math.min(width - rx, LOUPE_RADIUS * 2 + 1 + Math.min(0, mouseX - LOUPE_RADIUS))
+        const rh = Math.min(height - ry, LOUPE_RADIUS * 2 + 1 + Math.min(0, mouseY - LOUPE_RADIUS))
+        if (rw > 0 && rh > 0) {
+          regionData = srcCtx.getImageData(rx, ry, rw, rh)
+        }
+      }
+    }
+
+    // Helper to read a pixel from either direct array or canvas region
+    const readPixel = (sx: number, sy: number): [number, number, number, number] | null => {
+      if (sx < 0 || sy < 0 || sx >= width || sy >= height) return null
+      if (pixels) {
+        const idx = (sy * width + sx) * 4
+        return [pixels[idx], pixels[idx + 1], pixels[idx + 2], pixels[idx + 3]]
+      }
+      if (regionData) {
+        const rx = Math.max(0, mouseX - LOUPE_RADIUS)
+        const ry = Math.max(0, mouseY - LOUPE_RADIUS)
+        const lx = sx - rx
+        const ly = sy - ry
+        if (lx < 0 || ly < 0 || lx >= regionData.width || ly >= regionData.height) return null
+        const idx = (ly * regionData.width + lx) * 4
+        return [regionData.data[idx], regionData.data[idx + 1], regionData.data[idx + 2], regionData.data[idx + 3]]
+      }
+      return null
+    }
 
     // Draw checkerboard background for transparency
     for (let dy = -LOUPE_RADIUS; dy <= LOUPE_RADIUS; dy++) {
@@ -44,10 +80,9 @@ export function MagnifierLoupe({ pixels, width, height, mouseX, mouseY, canvasRe
           }
         }
 
-        if (sx >= 0 && sy >= 0 && sx < width && sy < height) {
-          const idx = (sy * width + sx) * 4
-          const r = pixels[idx], g = pixels[idx + 1], b = pixels[idx + 2], a = pixels[idx + 3]
-          ctx.fillStyle = `rgba(${r},${g},${b},${a / 255})`
+        const pixel = readPixel(sx, sy)
+        if (pixel) {
+          ctx.fillStyle = `rgba(${pixel[0]},${pixel[1]},${pixel[2]},${pixel[3] / 255})`
           ctx.fillRect(px, py, PIXEL_SIZE, PIXEL_SIZE)
         }
       }
@@ -71,7 +106,7 @@ export function MagnifierLoupe({ pixels, width, height, mouseX, mouseY, canvasRe
     ctx.lineWidth = 1
     ctx.strokeRect(c + 2, c + 2, PIXEL_SIZE - 4, PIXEL_SIZE - 4)
 
-  }, [visible, pixels, width, height, mouseX, mouseY])
+  }, [visible, pixels, sourceCanvas, width, height, mouseX, mouseY])
 
   if (!visible) return null
 
@@ -88,8 +123,17 @@ export function MagnifierLoupe({ pixels, width, height, mouseX, mouseY, canvasRe
   // Read center pixel for label
   let colorLabel = ''
   if (mouseX >= 0 && mouseY >= 0 && mouseX < width && mouseY < height) {
-    const idx = (mouseY * width + mouseX) * 4
-    const r = pixels[idx], g = pixels[idx + 1], b = pixels[idx + 2], a = pixels[idx + 3]
+    let r = 0, g = 0, b = 0, a = 0
+    if (pixels) {
+      const idx = (mouseY * width + mouseX) * 4
+      r = pixels[idx]; g = pixels[idx + 1]; b = pixels[idx + 2]; a = pixels[idx + 3]
+    } else if (sourceCanvas) {
+      const srcCtx = sourceCanvas.getContext('2d')
+      if (srcCtx) {
+        const d = srcCtx.getImageData(mouseX, mouseY, 1, 1).data
+        r = d[0]; g = d[1]; b = d[2]; a = d[3]
+      }
+    }
     const hex = `#${r.toString(16).padStart(2, '0').toUpperCase()}${g.toString(16).padStart(2, '0').toUpperCase()}${b.toString(16).padStart(2, '0').toUpperCase()}`
     colorLabel = `${hex}  A:${a}`
   }

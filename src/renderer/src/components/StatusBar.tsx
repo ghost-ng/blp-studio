@@ -81,7 +81,9 @@ export function StatusBar({ message, manifest, progress, sharedDataPaths = [], o
             {progress.total > 1 ? `${progress.current}/${progress.total} (${pct}%) ` : ''}{progress.name}
           </span>
         ) : (
-          <span className="truncate flex-1">{message}</span>
+          <span className="truncate flex-1">
+            {message}
+          </span>
         )}
         {manifest && (
           <div className="flex items-center gap-3 ml-4">

@@ -14,7 +14,6 @@ export interface Preferences {
   ddsDefaultBackground: 'checkerboard' | 'black' | 'white'
   compressionMode: 'auto' | 'always' | 'never'
   experimentalFeatures: boolean
-  preloadTextures: boolean
 }
 
 const MAX_RECENT = 10
@@ -27,7 +26,6 @@ const defaults: Preferences = {
   ddsDefaultBackground: 'checkerboard',
   compressionMode: 'auto',
   experimentalFeatures: false,
-  preloadTextures: false,
 }
 
 let prefsPath = ''
@@ -56,7 +54,6 @@ export function loadPreferences(): Preferences {
         ddsDefaultBackground: ['checkerboard', 'black', 'white'].includes(raw.ddsDefaultBackground) ? raw.ddsDefaultBackground : 'checkerboard',
         compressionMode: ['auto', 'always', 'never'].includes(raw.compressionMode) ? raw.compressionMode : 'auto',
         experimentalFeatures: raw.experimentalFeatures === true,
-        preloadTextures: raw.preloadTextures === true,
       }
       return cached
     }
@@ -93,7 +90,6 @@ export function updatePreferences(partial: Partial<Preferences>): void {
   if (partial.ddsDefaultBackground !== undefined) prefs.ddsDefaultBackground = partial.ddsDefaultBackground
   if (partial.compressionMode !== undefined) prefs.compressionMode = partial.compressionMode
   if (partial.experimentalFeatures !== undefined) prefs.experimentalFeatures = partial.experimentalFeatures
-  if (partial.preloadTextures !== undefined) prefs.preloadTextures = partial.preloadTextures
   save()
 }
 

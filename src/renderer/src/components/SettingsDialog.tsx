@@ -7,7 +7,6 @@ export interface SettingsData {
   ddsDefaultBackground: 'checkerboard' | 'black' | 'white'
   compressionMode: 'auto' | 'always' | 'never'
   experimentalFeatures: boolean
-  preloadTextures: boolean
 }
 
 interface SettingsDialogProps {
@@ -164,14 +163,6 @@ export function SettingsDialog({ open, onClose, settings, onSave }: SettingsDial
           <div className="mb-2">
             <h3 className="text-xs uppercase tracking-wider text-gray-500 font-medium mb-1">Advanced</h3>
             <div className="border-b border-gray-700">
-              <SettingRow label="Preload textures on open" description="Cache all texture previews when a BLP file is opened. Uses more memory but makes browsing instant.">
-                <button
-                  onClick={() => update('preloadTextures', !draft.preloadTextures)}
-                  className={`relative w-10 h-5 rounded-full transition-colors ${draft.preloadTextures ? 'bg-blue-600' : 'bg-gray-600'}`}
-                >
-                  <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform ${draft.preloadTextures ? 'translate-x-5' : ''}`} />
-                </button>
-              </SettingRow>
               <SettingRow label="Enable experimental features" description="Unlocks asset replacement and save functionality">
                 <button
                   onClick={() => update('experimentalFeatures', !draft.experimentalFeatures)}

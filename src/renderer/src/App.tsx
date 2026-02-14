@@ -45,7 +45,8 @@ interface TexturePreview {
   mips: number
   dxgiFormat: number
   dxgiFormatName: string
-  rgbaPixels: Uint8Array | null
+  rgbaPixels?: Uint8Array | null  // populated renderer-side via blp-preview:// protocol fetch
+  bitmap?: ImageBitmap | null     // GPU-resident texture for instant display (off V8 heap)
   tooLarge?: boolean
 }
 
@@ -84,7 +85,7 @@ declare global {
       getStatus: () => Promise<{ oodleLoaded: boolean; sharedDataDirs: number; sharedDataFiles: number; sharedDataPaths: string[]; gameRoot: string | null; gameDetected: boolean; replacementCount: number }>
       openFolder: (folderPath: string) => Promise<void>
       onProgress: (callback: (info: ProgressInfo | null) => void) => () => void
-      getPreferences: () => Promise<{ theme: 'dark' | 'light'; recentFiles: string[]; defaultExportFormat: 'png' | 'jpg'; jpgQuality: number; ddsDefaultBackground: 'checkerboard' | 'black' | 'white'; compressionMode: 'auto' | 'always' | 'never'; experimentalFeatures: boolean; preloadTextures: boolean }>
+      getPreferences: () => Promise<{ theme: 'dark' | 'light'; recentFiles: string[]; defaultExportFormat: 'png' | 'jpg'; jpgQuality: number; ddsDefaultBackground: 'checkerboard' | 'black' | 'white'; compressionMode: 'auto' | 'always' | 'never'; experimentalFeatures: boolean }>
       setTheme: (theme: 'dark' | 'light') => Promise<void>
       updatePreferences: (prefs: Record<string, unknown>) => Promise<void>
       getVersion: () => Promise<string>
@@ -111,10 +112,12 @@ declare global {
       extractWwiseAudio: (name: string, fileId: number) => Promise<{ data: Uint8Array; id: number } | null>
       extractAllWwiseAudio: (name: string, outputDir: string) => Promise<{ success: number; failed: number }>
       extractBlobsByType: (blobType: number, outputDir: string) => Promise<{ success: number; failed: number }>
+      decodeWwiseAudio: (audioData: Uint8Array) => Promise<Uint8Array | null>
       exportTexturesBatch: (names: string[], outputDir: string, format: string, quality?: number) => Promise<{ success: number; failed: number }>
       getThumbnails: (names: string[]) => Promise<Record<string, { width: number; height: number; rgbaPixels: Uint8Array }>>
-      preloadTextures: () => Promise<{ loaded: number; total: number }>
-      onPreloadProgress: (callback: (info: ProgressInfo) => void) => () => void
+      closeCache: (filepath: string) => Promise<void>
+      logTiming: (msg: string) => Promise<void>
+      onPreloadProgress: (callback: (info: { current: number; total: number }) => void) => () => void
       onDdsLoadFile: (callback: (filepath: string) => void) => () => void
     }
   }
@@ -132,6 +135,10 @@ interface TabState {
   replacedAssets: Set<string>
   statusMessage: string
 }
+
+// Module-level texture preview cache — avoids re-fetching 16MB RGBA over protocol
+// Keyed by asset name. Cleared when a new BLP is opened (different asset set).
+const rendererTextureCache = new Map<string, TexturePreview>()
 
 function sanitizeModId(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'blp-studio-mod'
@@ -169,7 +176,6 @@ export default function App() {
     ddsDefaultBackground: 'checkerboard',
     compressionMode: 'auto',
     experimentalFeatures: false,
-    preloadTextures: false,
   })
 
   // Keep ref to settings for use in callbacks without dep changes
@@ -185,6 +191,7 @@ export default function App() {
   const [activeTabId, setActiveTabId] = useState<string | null>(null)
   const tabsRef = useRef<TabState[]>([])
   tabsRef.current = tabs
+  const switchingRef = useRef(false) // guard against concurrent tab switches
   const currentTabStateRef = useRef<{
     manifest: BLPManifest | null; selectedAsset: AssetEntry | null; selectedAssets: Set<string>;
     preview: TexturePreview | null; assetData: AssetData | null; replacedAssets: Set<string>; statusMessage: string
@@ -210,7 +217,6 @@ export default function App() {
         ddsDefaultBackground: prefs.ddsDefaultBackground || 'checkerboard',
         compressionMode: prefs.compressionMode || 'auto',
         experimentalFeatures: prefs.experimentalFeatures === true,
-        preloadTextures: prefs.preloadTextures === true,
       })
     })
     window.electronAPI.getVersion().then(v => setAppVersion(v))
@@ -273,13 +279,84 @@ export default function App() {
     return cleanup
   }, [])
 
-  // Listen for preload-progress events
+  // Background renderer pre-fetch — pull all textures into rendererTextureCache for true 0ms clicks
   useEffect(() => {
-    const cleanup = window.electronAPI.onPreloadProgress((info) => {
-      setProgress(info.current >= info.total ? null : info)
-    })
-    return cleanup
-  }, [])
+    if (!manifest) return
+
+    const textures = manifest.assets.filter(a => a.type === 'texture')
+    if (textures.length === 0) {
+      setProgress(null)
+      return
+    }
+
+    let aborted = false
+
+    async function prefetchAll() {
+      const t0 = performance.now()
+      const total = textures.length
+      // Only update progress bar every Nth texture to avoid flooding React with re-renders
+      const updateInterval = Math.max(1, Math.ceil(total / 10))
+      window.electronAPI.logTiming(`[progress-bar] start: pre-rendering ${total} textures`)
+      setProgress({ current: 0, total, name: 'Pre-rendering textures...' })
+      let fetched = 0
+
+      for (const asset of textures) {
+        if (aborted) break
+        if (rendererTextureCache.has(asset.name)) {
+          fetched++
+          continue
+        }
+
+        // Yield to let user interactions take priority
+        await new Promise(r => setTimeout(r, 0))
+        if (aborted) break
+
+        try {
+          const resp = await fetch(`blp-preview://${encodeURIComponent(asset.name)}`)
+          if (!resp.ok) continue
+
+          const buffer = await resp.arrayBuffer()
+          const view = new DataView(buffer)
+          const metaLen = view.getUint32(0, true)
+          const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 4, metaLen)))
+
+          let bitmap: ImageBitmap | null = null
+          if (!meta.tooLarge && buffer.byteLength > 4 + metaLen) {
+            // Create GPU-resident ImageBitmap — keeps texture data OFF V8's heap.
+            // Without this, 43 textures × 16MB = 688MB on V8's heap causes 2-5s GC pauses.
+            const pixelData = new Uint8Array(buffer, 4 + metaLen)
+            const imageData = new ImageData(
+              new Uint8ClampedArray(pixelData.buffer, pixelData.byteOffset, pixelData.byteLength),
+              meta.width, meta.height
+            )
+            bitmap = await createImageBitmap(imageData)
+            // pixelData and buffer go out of scope → V8 can GC the response ArrayBuffer
+          }
+
+          rendererTextureCache.set(asset.name, {
+            name: asset.name, width: meta.width, height: meta.height,
+            mips: meta.mips, dxgiFormat: meta.dxgiFormat,
+            dxgiFormatName: meta.dxgiFormatName, rgbaPixels: null, bitmap, tooLarge: meta.tooLarge
+          })
+          fetched++
+        } catch { /* skip failed textures */ }
+
+        // Throttled progress update — avoids 43 React re-renders
+        if (fetched % updateInterval === 0) {
+          setProgress({ current: fetched, total, name: 'Pre-rendering textures...' })
+        }
+      }
+
+      if (!aborted) {
+        const elapsed = ((performance.now() - t0) / 1000).toFixed(1)
+        window.electronAPI.logTiming(`[progress-bar] finish: ${fetched}/${total} textures in ${elapsed}s`)
+        setProgress(null)
+      }
+    }
+
+    prefetchAll()
+    return () => { aborted = true }
+  }, [manifest])
 
   // Tab management helpers
   const saveActiveTab = useCallback(() => {
@@ -302,35 +379,45 @@ export default function App() {
   }, [])
 
   const handleSelectTab = useCallback(async (tabId: string) => {
-    if (tabId === activeTabId) return
-    let targetTab: TabState | undefined
-    const s = currentTabStateRef.current
-    setTabs(prev => {
-      const updated = prev.map(t => {
-        if (t.id === activeTabId) {
-          return { ...t, manifest: s.manifest, selectedAsset: s.selectedAsset, selectedAssets: s.selectedAssets,
-            preview: s.preview, assetData: s.assetData, replacedAssets: s.replacedAssets, statusMessage: s.statusMessage }
-        }
-        return t
+    if (tabId === activeTabId || switchingRef.current) return
+    switchingRef.current = true
+    try {
+      let targetTab: TabState | undefined
+      const s = currentTabStateRef.current
+      setTabs(prev => {
+        const updated = prev.map(t => {
+          if (t.id === activeTabId) {
+            return { ...t, manifest: s.manifest, selectedAsset: s.selectedAsset, selectedAssets: s.selectedAssets,
+              preview: s.preview, assetData: s.assetData, replacedAssets: s.replacedAssets, statusMessage: s.statusMessage }
+          }
+          return t
+        })
+        targetTab = updated.find(t => t.id === tabId)
+        return updated
       })
-      targetTab = updated.find(t => t.id === tabId)
-      return updated
-    })
-    if (!targetTab) return
-    // Instantly show cached state
-    loadTabState(targetTab)
-    setActiveTabId(tabId)
-    // Switch parser context in background
-    if (targetTab.filepath) {
-      try { await window.electronAPI.openBLP(targetTab.filepath) } catch { /* cached */ }
+      if (!targetTab) return
+      // Instantly show cached state
+      loadTabState(targetTab)
+      setActiveTabId(tabId)
+      // Switch parser context in background (fire-and-forget, UI already restored)
+      if (targetTab.filepath) {
+        window.electronAPI.openBLP(targetTab.filepath).catch(() => { /* parser cache handles this */ })
+      }
+    } finally {
+      switchingRef.current = false
     }
   }, [activeTabId, loadTabState])
 
   const handleCloseTab = useCallback(async (tabId: string) => {
     const tabIndex = tabsRef.current.findIndex(t => t.id === tabId)
     if (tabIndex === -1) return
+    const closedTab = tabsRef.current[tabIndex]
     const remaining = tabsRef.current.filter(t => t.id !== tabId)
     setTabs(remaining)
+    // Free main-process cache if no other tab uses the same filepath
+    if (closedTab.filepath && !remaining.some(t => t.filepath === closedTab.filepath)) {
+      window.electronAPI.closeCache(closedTab.filepath).catch(() => {})
+    }
     if (tabId === activeTabId) {
       if (remaining.length > 0) {
         const nextTab = remaining[Math.min(tabIndex, remaining.length - 1)]
@@ -385,15 +472,18 @@ export default function App() {
     setPreview(null)
     setAssetData(null)
     setReplacedAssets(new Set())
+    rendererTextureCache.clear()
 
     try {
       const result = await window.electronAPI.openBLP(filepath) as (BLPManifest & { error?: string }) | { error: string } | null
       if (!result) {
         setStatusMessage('Failed to open BLP file.')
         notify('error', 'Failed to open file', 'No data returned')
+        setProgress(null)
       } else if ('error' in result && result.error) {
         setStatusMessage(`Failed to open BLP: ${result.error}`)
         notify('error', 'Failed to open file', result.error as string)
+        setProgress(null)
       } else if ('assets' in result) {
         const blpManifest = result as BLPManifest
         setManifest(blpManifest)
@@ -426,17 +516,13 @@ export default function App() {
           const bkCount = await window.electronAPI.getBackupCount()
           setBackupCount(bkCount)
         } catch { /* ignore */ }
-        // Preload all textures in background if setting enabled
-        if (settingsRef.current.preloadTextures && blpManifest.sharedDataCount > 0 && blpManifest.oodleLoaded) {
-          window.electronAPI.preloadTextures().catch(e => console.warn('Preload failed:', e))
-        }
       }
     } catch (err) {
       setStatusMessage(`Error: ${err}`)
       notify('error', 'Failed to open file', String(err))
+      setProgress(null)
     } finally {
       setLoading(false)
-      setProgress(null)
     }
   }, [notify, handleSelectTab, saveActiveTab, activeTabId])
 
@@ -498,11 +584,22 @@ export default function App() {
 
   // Context menu: copy preview image to clipboard
   const handleCopyPreviewAsPng = useCallback(async () => {
-    if (!preview || !preview.rgbaPixels) return
+    if (!preview) return
     try {
-      const ok = await window.electronAPI.copyPreviewAsPng(
-        new Uint8Array(preview.rgbaPixels), preview.width, preview.height
-      )
+      let pixels: Uint8Array
+      if (preview.rgbaPixels) {
+        pixels = new Uint8Array(preview.rgbaPixels)
+      } else if (preview.bitmap) {
+        const canvas = document.createElement('canvas')
+        canvas.width = preview.width
+        canvas.height = preview.height
+        const ctx = canvas.getContext('2d')!
+        ctx.drawImage(preview.bitmap, 0, 0)
+        pixels = new Uint8Array(ctx.getImageData(0, 0, preview.width, preview.height).data.buffer)
+      } else {
+        return
+      }
+      const ok = await window.electronAPI.copyPreviewAsPng(pixels, preview.width, preview.height)
       if (ok) {
         notify('success', 'Copied to clipboard', `${preview.width}x${preview.height} PNG`)
       } else {
@@ -620,27 +717,66 @@ export default function App() {
     setDragging(false)
   }, [])
 
+  const handlePainted = useCallback(() => {
+    setLoading(false)
+    setProgress(null)
+  }, [])
+
   const handleSelectAsset = useCallback(async (asset: AssetEntry) => {
     setSelectedAsset(asset)
     setAssetData(null)
 
     if (asset.type === 'texture') {
+      // Check renderer-side cache first — avoids 50-60ms protocol transfer for previously-viewed textures
+      const cached = rendererTextureCache.get(asset.name)
+      if (cached) {
+        window.electronAPI.logTiming(`[renderer] ${asset.name}: cache-hit (${cached.width}x${cached.height})`)
+        setProgress({ current: 0, total: 1, name: `Rendering ${asset.name.replace(/^TEXTURE_/, '')}...` })
+        setPreview(cached)
+        setLoading(false)
+        return
+      }
+
       setPreview(null)
       setLoading(true)
-      setProgress({ current: 0, total: 1, name: `Loading ${asset.name}...` })
+      window.electronAPI.logTiming(`[preview] ${asset.name}: loading start`)
+      // Yield so React can render the loading bar before the fetch starts
+      await new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)))
       try {
-        const texPreview = await window.electronAPI.getTexturePreview(asset.name)
-        setPreview(texPreview)
-      } catch {
+        // Single fetch via custom protocol — zero IPC (IPC channel gets clogged by thumbnails)
+        // Response format: [4 bytes: JSON length LE] [JSON metadata] [RGBA pixels if any]
+        const t0 = performance.now()
+        const resp = await fetch(`blp-preview://${encodeURIComponent(asset.name)}`)
+        if (!resp.ok) throw new Error(`Protocol error: ${resp.status}`)
+
+        const buffer = await resp.arrayBuffer()
+        const view = new DataView(buffer)
+        const metaLen = view.getUint32(0, true)
+        const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 4, metaLen)))
+
+        let rgbaPixels: Uint8Array | null = null
+        if (!meta.tooLarge && buffer.byteLength > 4 + metaLen) {
+          const src = new Uint8Array(buffer, 4 + metaLen)
+          const copy = new Uint8Array(src.length)
+          copy.set(src)
+          rgbaPixels = copy
+        }
+        const t1 = performance.now()
+        window.electronAPI.logTiming(`[preview] ${asset.name}: loaded in ${(t1 - t0).toFixed(0)}ms (${meta.width}x${meta.height})`)
+
+        const result: TexturePreview = { name: asset.name, width: meta.width, height: meta.height, mips: meta.mips, dxgiFormat: meta.dxgiFormat, dxgiFormatName: meta.dxgiFormatName, rgbaPixels, tooLarge: meta.tooLarge }
+        rendererTextureCache.set(asset.name, result)
+        setPreview(result)
+      } catch (err) {
+        window.electronAPI.logTiming(`[preview] ${asset.name}: failed — ${err}`)
+        console.error('[renderer] texture preview failed:', err)
         setPreview(null)
       } finally {
         setLoading(false)
-        setProgress(null)
       }
     } else {
       setPreview(null)
       setLoading(true)
-      setProgress({ current: 0, total: 1, name: `Loading ${asset.name}...` })
       try {
         const data = await window.electronAPI.getAssetData(asset.name)
         setAssetData(data)
@@ -648,7 +784,6 @@ export default function App() {
         setAssetData(null)
       } finally {
         setLoading(false)
-        setProgress(null)
       }
     }
   }, [])
@@ -890,6 +1025,7 @@ export default function App() {
               isReplaced={isReplaced}
               onCopyImage={handleCopyPreviewAsPng}
               experimentalEnabled={settingsData.experimentalFeatures}
+              onPainted={handlePainted}
             />
           </div>
 

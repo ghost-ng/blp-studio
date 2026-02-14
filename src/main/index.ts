@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, Menu, nativeImage, clipboard } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, shell, Menu, nativeImage, clipboard, protocol } from 'electron'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { BLPParser } from '../core/blp-parser'
@@ -17,20 +17,27 @@ import { generateModinfo, generateDep, sanitizeModId } from '../core/mod-manifes
 import { parseWwiseBank, extractWemFile } from '../core/wwise-bank'
 import { initPreferences, loadPreferences, setTheme, updatePreferences, addRecentFile, clearRecentFiles } from '../core/preferences'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, unlinkSync } from 'fs'
+import { execFile } from 'child_process'
+import { randomBytes } from 'crypto'
+
+function ts(): string { return new Date().toISOString().slice(11, 23) }
 
 // ---- App State ----
 let mainWindow: BrowserWindow | null = null
 let currentParser: BLPParser | null = null
+const parserCache = new Map<string, BLPParser>() // filepath -> parsed BLP (for fast tab switching)
 let sdIndex: Map<string, string> = new Map()
 let oodle: OodleDecompressor | null = null
 let gameRoot: string | null = null
 let sdDirs: string[] = []
-// Preloaded texture preview cache (name -> preview result)
-const texturePreviewCache = new Map<string, { name: string; width: number; height: number; mips: number; dxgiFormat: number; dxgiFormatName: string; rgbaPixels: Buffer }>()
-let previewCacheBytes = 0
-let previewCacheFilepath = '' // filepath the cache belongs to
-let preloadGeneration = 0    // incremented on blp:open to cancel in-flight preloads
-const MAX_CACHE_BYTES = 512 * 1024 * 1024 // 512 MB memory budget
+// Texture metadata index: maps asset name → texture info (built during collectAssets)
+interface TextureInfo {
+  width: number
+  height: number
+  mips: number
+  format: number
+}
+let textureIndex: Map<string, TextureInfo> = new Map()
 
 // Replacement data: maps asset name → raw replacement bytes + DDS metadata
 interface ReplacementData {
@@ -38,6 +45,34 @@ interface ReplacementData {
   ddsInfo?: { width: number; height: number; format: number; mips: number; formatName: string }
 }
 const replacements: Map<string, ReplacementData> = new Map()
+
+// ---- Texture preload cache ----
+// Decoded RGBA pixels cached per BLP filepath. Populated in background after BLP open.
+interface PreloadedTexture {
+  rgbaPixels: Uint8Array
+  width: number
+  height: number
+  mips: number
+  format: number
+  sizeBytes: number
+}
+const texturePreloadCache = new Map<string, Map<string, PreloadedTexture>>()
+let totalPreloadBytes = 0
+const MAX_PRELOAD_BYTES = 1 * 1024 * 1024 * 1024  // 1GB
+const activePreloads = new Map<string, { abort: boolean }>()
+
+// ---- vgmstream-cli path resolution ----
+function findVgmstream(): string | null {
+  const candidates = [
+    join(process.resourcesPath || '', 'resources', 'vgmstream-cli.exe'),
+    join(process.cwd(), 'resources', 'vgmstream-cli.exe'),
+    join(__dirname, '../../resources', 'vgmstream-cli.exe'),
+  ]
+  for (const p of candidates) {
+    if (existsSync(p)) return p
+  }
+  return null
+}
 
 // ---- Icon ----
 function getAppIcon(): Electron.NativeImage | undefined {
@@ -292,6 +327,7 @@ interface AssetEntry {
 function collectAssets(parser: BLPParser): AssetEntry[] {
   const assets: AssetEntry[] = []
   const seen = new Set<string>()
+  const texIdx = new Map<string, TextureInfo>()
 
   for (const alloc of parser.iterEntriesByType('BLP::TextureEntry')) {
     const obj = parser.deserializeAlloc(alloc)
@@ -302,6 +338,7 @@ function collectAssets(parser: BLPParser): AssetEntry[] {
     const h = (obj.m_nHeight as number) || 0
     const mipCount = (obj.m_nMips as number) || 1
     const fmt = (obj.m_eFormat as number) || 0
+    texIdx.set(name, { width: w, height: h, mips: mipCount, format: fmt })
     assets.push({
       name,
       type: 'texture',
@@ -321,6 +358,7 @@ function collectAssets(parser: BLPParser): AssetEntry[] {
       }
     })
   }
+  textureIndex = texIdx
 
   for (const alloc of parser.iterEntriesByType('BLP::BlobEntry')) {
     const obj = parser.deserializeAlloc(alloc)
@@ -377,6 +415,92 @@ function collectAssets(parser: BLPParser): AssetEntry[] {
   }
 
   return assets
+}
+
+// Evict the entire oldest non-current filepath's preload cache
+function evictPreloadCache(): boolean {
+  const currentFp = currentParser?.filepath
+  for (const [fp, cache] of texturePreloadCache.entries()) {
+    if (fp === currentFp) continue
+    let freed = 0
+    for (const tex of cache.values()) freed += tex.sizeBytes
+    texturePreloadCache.delete(fp)
+    totalPreloadBytes -= freed
+    console.log(`${ts()} [preload] evicted cache for ${fp} (freed ${(freed / 1024 / 1024).toFixed(0)}MB)`)
+    return true
+  }
+  return false // nothing to evict (all cache belongs to current filepath)
+}
+
+// Background preload all textures for a BLP file
+async function preloadTextures(filepath: string, texInfoSnapshot: Map<string, TextureInfo>): Promise<void> {
+  // Abort any active preload for a different filepath
+  for (const [fp, job] of activePreloads.entries()) {
+    if (fp !== filepath) job.abort = true
+  }
+
+  // Skip if already fully cached
+  const existing = texturePreloadCache.get(filepath)
+  if (existing && existing.size >= texInfoSnapshot.size) return
+
+  const jobHandle = { abort: false }
+  activePreloads.set(filepath, jobHandle)
+
+  if (!texturePreloadCache.has(filepath)) {
+    texturePreloadCache.set(filepath, new Map())
+  }
+  const fileCache = texturePreloadCache.get(filepath)!
+
+  const MAX_PREVIEW_PIXELS = 2048 * 2048
+  const textures: Array<[string, TextureInfo]> = []
+  for (const [name, info] of texInfoSnapshot.entries()) {
+    if (fileCache.has(name)) continue
+    if (info.width * info.height > MAX_PREVIEW_PIXELS) continue
+    textures.push([name, info])
+  }
+
+  const total = textures.length
+  if (total === 0) { activePreloads.delete(filepath); return }
+  let completed = 0
+  const tStart = performance.now()
+
+  for (const [name, info] of textures) {
+    if (jobHandle.abort) break
+
+    // Yield event loop so protocol handler and other IPC can run
+    await new Promise(r => setImmediate(r))
+
+    try {
+      const rawData = getTextureRawData(name, info as unknown as Record<string, unknown>)
+      if (!rawData) continue
+
+      const rgbaPixels = decodeBCn(rawData, info.width, info.height, info.format)
+      const sizeBytes = rgbaPixels.byteLength
+
+      fileCache.set(name, {
+        rgbaPixels, width: info.width, height: info.height,
+        mips: info.mips, format: info.format, sizeBytes
+      })
+      totalPreloadBytes += sizeBytes
+
+      // Enforce memory budget
+      while (totalPreloadBytes > MAX_PRELOAD_BYTES) {
+        if (!evictPreloadCache()) break // can't evict current — stop
+      }
+
+      completed++
+      if (completed % 5 === 0 || completed === total) {
+        mainWindow?.webContents.send('preload-progress', { current: completed, total })
+      }
+    } catch {
+      // Skip failed textures
+    }
+  }
+
+  activePreloads.delete(filepath)
+  const elapsed = performance.now() - tStart
+  console.log(`${ts()} [preload] ${filepath}: ${completed}/${total} textures in ${(elapsed / 1000).toFixed(1)}s (${(totalPreloadBytes / 1024 / 1024).toFixed(0)}MB total cache)`)
+  mainWindow?.webContents.send('preload-progress', { current: total, total })
 }
 
 function getTextureRawData(name: string, metadata: Record<string, unknown>): Buffer | null {
@@ -481,29 +605,43 @@ function setupIPC() {
     if (!isString(filepath)) return null
 
     try {
-      const parser = new BLPParser(filepath)
-      parser.parse()
-      currentParser = parser
-      replacements.clear()
-      preloadGeneration++
-      // Only clear cache if opening a different file (tab switch re-opens same file)
-      if (previewCacheFilepath !== filepath) {
-        texturePreviewCache.clear()
-        previewCacheBytes = 0
-        previewCacheFilepath = filepath
-      }
+      // Fast path: reuse cached parser for tab switching
+      const cached = parserCache.get(filepath)
+      let parser: BLPParser
+      if (cached) {
+        parser = cached
+        currentParser = parser
+        // Only need to update window title and set currentParser
+        if (mainWindow) {
+          mainWindow.setTitle(`BLP Studio - ${parser.filename}`)
+        }
+        initSharedData(filepath)
+      } else {
+        // Full parse for newly opened files
+        parser = new BLPParser(filepath)
+        parser.parse()
+        currentParser = parser
+        parserCache.set(filepath, parser)
+        replacements.clear()
 
-      // Init SHARED_DATA from BLP path
-      initSharedData(filepath)
+        // Init SHARED_DATA from BLP path
+        initSharedData(filepath)
+
+        // Update window title and recent files
+        if (mainWindow) {
+          mainWindow.setTitle(`BLP Studio - ${parser.filename}`)
+        }
+        addRecentFile(filepath)
+        buildMenu()
+      }
 
       const assets = collectAssets(parser)
 
-      // Update window title and recent files
-      if (mainWindow) {
-        mainWindow.setTitle(`BLP Studio - ${parser.filename}`)
-      }
-      addRecentFile(filepath)
-      buildMenu()
+      // Fire-and-forget background preload of all textures
+      const texSnapshot = new Map(textureIndex)
+      preloadTextures(filepath, texSnapshot).catch(e => {
+        console.error('Texture preload failed:', e)
+      })
 
       const typeCounts: Record<string, number> = {}
       for (const a of assets) {
@@ -535,128 +673,71 @@ function setupIPC() {
     }
   })
 
+  // Free parser cache for a closed tab
+  ipcMain.handle('blp:close-cache', async (_e, filepath?: string) => {
+    if (!isString(filepath)) return
+    parserCache.delete(filepath)
+    // Abort active preload and free texture cache for this filepath
+    const job = activePreloads.get(filepath)
+    if (job) job.abort = true
+    const cache = texturePreloadCache.get(filepath)
+    if (cache) {
+      for (const tex of cache.values()) totalPreloadBytes -= tex.sizeBytes
+      texturePreloadCache.delete(filepath)
+    }
+  })
+
   ipcMain.handle('asset:preview', async (_e, name: string) => {
     if (!isString(name) || !currentParser) return null
 
-    // Check preload cache first
-    const cached = texturePreviewCache.get(name)
-    if (cached) return cached
+    const tStart = performance.now()
 
-    // Find the asset
-    for (const alloc of currentParser.iterEntriesByType('BLP::TextureEntry')) {
-      const obj = currentParser.deserializeAlloc(alloc)
-      if (obj.m_Name !== name) continue
+    // O(1) lookup from texture index (built during collectAssets)
+    const info = textureIndex.get(name)
+    if (!info) return null
 
-      const w = (obj.m_nWidth as number) || 0
-      const h = (obj.m_nHeight as number) || 0
-      const mips = (obj.m_nMips as number) || 1
-      const fmt = (obj.m_eFormat as number) || 0
+    const { width: w, height: h, mips, format: fmt } = info
 
-      // Cap preview size to prevent OOM on huge textures (RGBA8 = 4 bytes/pixel)
-      const MAX_PREVIEW_PIXELS = 2048 * 2048  // 16MB RGBA limit
-      if (w * h > MAX_PREVIEW_PIXELS) {
-        return {
-          name,
-          width: w,
-          height: h,
-          mips,
-          dxgiFormat: fmt,
-          dxgiFormatName: dxgiName(fmt),
-          rgbaPixels: null,
-          tooLarge: true,
-        }
-      }
-
-      const rawData = getTextureRawData(name, {
-        width: w, height: h, mips, format: fmt
-      })
-
-      if (!rawData) return null
-
-      try {
-        // Decode BCn to RGBA for the first mip level only
-        const rgbaPixels = decodeBCn(rawData, w, h, fmt)
-        return {
-          name,
-          width: w,
-          height: h,
-          mips,
-          dxgiFormat: fmt,
-          dxgiFormatName: dxgiName(fmt),
-          rgbaPixels,
-        }
-      } catch (e) {
-        console.error(`Failed to decode texture ${name}:`, e)
-        return null
+    // Cap preview size to prevent OOM on huge textures (RGBA8 = 4 bytes/pixel)
+    const MAX_PREVIEW_PIXELS = 2048 * 2048  // 16MB RGBA limit
+    if (w * h > MAX_PREVIEW_PIXELS) {
+      return {
+        name,
+        width: w,
+        height: h,
+        mips,
+        dxgiFormat: fmt,
+        dxgiFormatName: dxgiName(fmt),
+        rgbaPixels: null,
+        tooLarge: true,
       }
     }
 
-    return null
-  })
+    const t0 = performance.now()
+    const rawData = getTextureRawData(name, {
+      width: w, height: h, mips, format: fmt
+    })
+    const t1 = performance.now()
 
-  // ---- Preload all texture previews into cache ----
-  ipcMain.handle('blp:preload-textures', async () => {
-    if (!currentParser || !mainWindow) return { loaded: 0, total: 0 }
+    if (!rawData) return null
 
-    const gen = ++preloadGeneration
-    const MAX_PREVIEW_PIXELS = 2048 * 2048
-    const textures: { name: string; w: number; h: number; mips: number; fmt: number }[] = []
+    try {
+      const rgbaPixels = decodeBCn(rawData, w, h, fmt)
+      const t2 = performance.now()
 
-    for (const alloc of currentParser.iterEntriesByType('BLP::TextureEntry')) {
-      const obj = currentParser.deserializeAlloc(alloc)
-      const name = obj.m_Name as string
-      if (!name || texturePreviewCache.has(name)) continue
-      const w = (obj.m_nWidth as number) || 0
-      const h = (obj.m_nHeight as number) || 0
-      if (w * h > MAX_PREVIEW_PIXELS || w === 0 || h === 0) continue
-      textures.push({ name, w, h, mips: (obj.m_nMips as number) || 1, fmt: (obj.m_eFormat as number) || 0 })
+      console.log(`${ts()} [preview-ipc] ${name}: read=${(t1-t0).toFixed(0)}ms, decode=${(t2-t1).toFixed(0)}ms, total=${(t2-tStart).toFixed(0)}ms (${w}x${h} fmt=${fmt}, ${(w*h*4/1024/1024).toFixed(1)}MB)`)
+      return {
+        name,
+        width: w,
+        height: h,
+        mips,
+        dxgiFormat: fmt,
+        dxgiFormatName: dxgiName(fmt),
+      }
+    } catch (e) {
+      console.error(`Failed to decode texture ${name}:`, e)
+      return null
     }
-
-    const total = textures.length
-    let loaded = 0
-    let lastProgressTime = Date.now()
-
-    for (const tex of textures) {
-      // Cancel if a new file was opened
-      if (preloadGeneration !== gen) return { loaded, total }
-      // Stop if memory budget exceeded
-      if (previewCacheBytes >= MAX_CACHE_BYTES) {
-        mainWindow?.webContents.send('preload-progress', { current: total, total, name: `Preloaded ${loaded}/${total} (memory limit reached)` })
-        return { loaded, total }
-      }
-
-      try {
-        const rawData = getTextureRawData(tex.name, { width: tex.w, height: tex.h, mips: tex.mips, format: tex.fmt })
-        if (rawData) {
-          const rgbaPixels = decodeBCn(rawData, tex.w, tex.h, tex.fmt)
-          texturePreviewCache.set(tex.name, {
-            name: tex.name,
-            width: tex.w,
-            height: tex.h,
-            mips: tex.mips,
-            dxgiFormat: tex.fmt,
-            dxgiFormatName: dxgiName(tex.fmt),
-            rgbaPixels,
-          })
-          previewCacheBytes += tex.w * tex.h * 4
-        }
-      } catch (e) {
-        console.warn('Preload skip:', tex.name, e)
-      }
-      loaded++
-
-      // Time-based progress throttle (~150ms) + always send on last item
-      const now = Date.now()
-      if (now - lastProgressTime >= 150 || loaded === total) {
-        lastProgressTime = now
-        mainWindow?.webContents.send('preload-progress', { current: loaded, total, name: `Preloading textures... ${loaded}/${total}` })
-      }
-
-      // Yield event loop every 5 textures to keep UI responsive
-      if (loaded % 5 === 0) await new Promise(r => setTimeout(r, 0))
-    }
-
-    return { loaded, total }
   })
 
   ipcMain.handle('asset:extract', async (_e, name: string, outputDir: string) => {
@@ -755,7 +836,11 @@ function setupIPC() {
       const rawSize = calcTextureSize(w, h, mips, fmt)
 
       const rawData = getTextureRawData(name, { width: w, height: h, mips, format: fmt })
-      if (!rawData) { skipped++; continue }
+      if (!rawData) {
+        console.warn(`Texture skip (no data): ${name} w=${w} h=${h} mips=${mips} fmt=${fmt} rawSize=${rawSize} sdPath=${sdIndex.get(name) || 'NONE'} oodleLoaded=${!!oodle}`)
+        skipped++
+        continue
+      }
 
       try {
         const header = makeDdsHeader(w, h, mips, fmt)
@@ -766,7 +851,8 @@ function setupIPC() {
         const safeName = name.replace(/[/\\]/g, '_')
         writeFileSync(join(texDir, `${safeName}.dds`), Buffer.concat([header, pixelData]))
         success++
-      } catch {
+      } catch (e) {
+        console.error(`Texture export failed: ${name}`, e)
         failed++
       }
     }
@@ -857,8 +943,9 @@ function setupIPC() {
         const raw = oodle.decompress(data, rawSize)
         if (raw) finalData = raw
       }
-      // Limit preview data to 256KB to keep IPC fast
-      const previewLimit = 256 * 1024
+      // Limit preview data to 256KB to keep IPC fast (except audio which needs full data)
+      const isAudio = blobType === 7
+      const previewLimit = isAudio ? Infinity : 256 * 1024
       const truncated = finalData.length > previewLimit
       const previewData = truncated ? finalData.subarray(0, previewLimit) : finalData
       return {
@@ -1188,6 +1275,12 @@ function setupIPC() {
     console.log(`Exported mod "${modId}" to ${modDir}: ${success} assets`)
     return { success, failed, modDir, modId }
   })
+
+  // Log relay: renderer → main process terminal
+  ipcMain.handle('log:timing', async (_e, msg: string) => {
+    if (typeof msg === 'string') console.log(`${ts()} ${msg}`)
+  })
+
 
   ipcMain.handle('app:status', async () => {
     return {
@@ -1544,48 +1637,55 @@ function setupIPC() {
   })
 
   // ---- Generate texture thumbnails ----
+  // Uses preload cache when available (avoids re-decoding), falls back to on-demand.
+  // Yields the event loop between each texture so protocol responses can flow.
   ipcMain.handle('asset:thumbnails', async (_e, names: string[]) => {
     if (!Array.isArray(names) || !currentParser) return {}
 
     const THUMB = 64
     const results: Record<string, { width: number; height: number; rgbaPixels: Uint8Array }> = {}
+    const preloadCache = texturePreloadCache.get(currentParser.filepath)
 
     for (const name of names) {
+      // Yield event loop so preview protocol and other handlers can run
+      await new Promise(r => setImmediate(r))
       try {
-        for (const alloc of currentParser.iterEntriesByType('BLP::TextureEntry')) {
-          const obj = currentParser.deserializeAlloc(alloc)
-          if (obj.m_Name !== name) continue
+        let rgba: Uint8Array
+        let w: number, h: number
 
-          const w = (obj.m_nWidth as number) || 0
-          const h = (obj.m_nHeight as number) || 0
-          const mips = (obj.m_nMips as number) || 1
-          const fmt = (obj.m_eFormat as number) || 0
+        // Try preload cache first (skip expensive decode)
+        const cached = preloadCache?.get(name)
+        if (cached) {
+          rgba = cached.rgbaPixels
+          w = cached.width
+          h = cached.height
+        } else {
+          const info = textureIndex.get(name)
+          if (!info) continue
+          w = info.width; h = info.height
+          const rawData = getTextureRawData(name, { width: w, height: h, mips: info.mips, format: info.format })
+          if (!rawData) continue
+          rgba = decodeBCn(rawData, w, h, info.format)
+        }
 
-          const rawData = getTextureRawData(name, { width: w, height: h, mips, format: fmt })
-          if (!rawData) break
-
-          const rgba = decodeBCn(rawData, w, h, fmt)
-
-          // Downscale to thumbnail (nearest-neighbor, preserve aspect ratio)
-          const scale = Math.min(THUMB / w, THUMB / h, 1)
-          const tw = Math.max(1, Math.round(w * scale))
-          const th = Math.max(1, Math.round(h * scale))
-          if (tw === w && th === h) {
-            results[name] = { width: w, height: h, rgbaPixels: rgba }
-          } else {
-            const out = new Uint8Array(tw * th * 4)
-            for (let y = 0; y < th; y++) {
-              for (let x = 0; x < tw; x++) {
-                const sx = Math.floor(x * w / tw)
-                const sy = Math.floor(y * h / th)
-                const si = (sy * w + sx) * 4
-                const di = (y * tw + x) * 4
-                out[di] = rgba[si]; out[di + 1] = rgba[si + 1]; out[di + 2] = rgba[si + 2]; out[di + 3] = rgba[si + 3]
-              }
+        // Downscale to thumbnail (nearest-neighbor, preserve aspect ratio)
+        const scale = Math.min(THUMB / w, THUMB / h, 1)
+        const tw = Math.max(1, Math.round(w * scale))
+        const th = Math.max(1, Math.round(h * scale))
+        if (tw === w && th === h) {
+          results[name] = { width: w, height: h, rgbaPixels: rgba }
+        } else {
+          const out = new Uint8Array(tw * th * 4)
+          for (let y = 0; y < th; y++) {
+            for (let x = 0; x < tw; x++) {
+              const sx = Math.floor(x * w / tw)
+              const sy = Math.floor(y * h / th)
+              const si = (sy * w + sx) * 4
+              const di = (y * tw + x) * 4
+              out[di] = rgba[si]; out[di + 1] = rgba[si + 1]; out[di + 2] = rgba[si + 2]; out[di + 3] = rgba[si + 3]
             }
-            results[name] = { width: tw, height: th, rgbaPixels: out }
           }
-          break
+          results[name] = { width: tw, height: th, rgbaPixels: out }
         }
       } catch {
         // Skip failed thumbnails
@@ -1832,6 +1932,41 @@ function setupIPC() {
     }
   })
 
+  // ---- Decode Wwise audio to PCM WAV via vgmstream-cli ----
+  ipcMain.handle('audio:decode-wwise', async (_e, audioData: Buffer): Promise<Buffer | null> => {
+    if (!audioData || audioData.length < 44) return null
+
+    const vgmstreamPath = findVgmstream()
+    if (!vgmstreamPath) {
+      console.warn('vgmstream-cli.exe not found, cannot decode Wwise audio')
+      return null
+    }
+
+    const id = randomBytes(8).toString('hex')
+    const tempIn = join(tmpdir(), `blp-wwise-${id}.wav`)
+    const tempOut = join(tmpdir(), `blp-pcm-${id}.wav`)
+
+    try {
+      writeFileSync(tempIn, Buffer.from(audioData))
+
+      await new Promise<void>((resolve, reject) => {
+        execFile(vgmstreamPath, ['-o', tempOut, tempIn], {
+          timeout: 30000,
+          cwd: join(vgmstreamPath, '..'), // DLLs are alongside the exe
+        }, (err) => err ? reject(err) : resolve())
+      })
+
+      const pcmData = readFileSync(tempOut)
+      return pcmData
+    } catch (e) {
+      console.error('Wwise audio decode failed:', e)
+      return null
+    } finally {
+      try { unlinkSync(tempIn) } catch { /* ignore */ }
+      try { unlinkSync(tempOut) } catch { /* ignore */ }
+    }
+  })
+
   // ---- Extract all blobs of a specific type ----
   ipcMain.handle('asset:extract-blobs-by-type', async (_e, blobType: number, outputDir: string) => {
     if (typeof blobType !== 'number' || !isString(outputDir) || !currentParser) return { success: 0, failed: 0 }
@@ -1903,8 +2038,89 @@ function setupIPC() {
   })
 }
 
+// ---- Custom protocol for serving preview data ----
+// Must be called before app.whenReady()
+protocol.registerSchemesAsPrivileged([{
+  scheme: 'blp-preview',
+  privileges: { standard: false, supportFetchAPI: true, corsEnabled: true }
+}])
+
 // ---- App lifecycle ----
 app.whenReady().then(() => {
+  // Full texture decode via custom protocol — bypasses IPC entirely
+  // Body format: [4 bytes: JSON length LE] [JSON metadata] [RGBA pixels if any]
+  // Checks preload cache first for instant response, falls back to on-demand decode.
+  protocol.handle('blp-preview', async (request) => {
+    const name = decodeURIComponent(request.url.replace('blp-preview://', ''))
+
+    if (!currentParser) return new Response('No parser', { status: 404 })
+
+    const info = textureIndex.get(name)
+    if (!info) return new Response('Not found', { status: 404 })
+
+    const { width, height, mips, format } = info
+    const meta = { width, height, mips, dxgiFormat: format, dxgiFormatName: dxgiName(format), tooLarge: false }
+
+    const MAX_PREVIEW_PIXELS = 2048 * 2048
+    if (width * height > MAX_PREVIEW_PIXELS) {
+      meta.tooLarge = true
+      const metaJson = Buffer.from(JSON.stringify(meta), 'utf-8')
+      const header = Buffer.alloc(4)
+      header.writeUInt32LE(metaJson.length, 0)
+      return new Response(Buffer.concat([header, metaJson]), {
+        status: 200, headers: { 'Content-Type': 'application/octet-stream' }
+      })
+    }
+
+    // Check preload cache first
+    const cached = texturePreloadCache.get(currentParser.filepath)?.get(name)
+    if (cached) {
+      const metaJson = Buffer.from(JSON.stringify(meta), 'utf-8')
+      const header = Buffer.alloc(4)
+      header.writeUInt32LE(metaJson.length, 0)
+      const body = Buffer.concat([header, metaJson, Buffer.from(cached.rgbaPixels.buffer, cached.rgbaPixels.byteOffset, cached.rgbaPixels.byteLength)])
+      console.log(`${ts()} [preview-cached] ${name}: instant (${width}x${height}, ${(body.length / 1024 / 1024).toFixed(1)}MB)`)
+      return new Response(body, {
+        status: 200, headers: { 'Content-Type': 'application/octet-stream' }
+      })
+    }
+
+    // Cache miss — decode on demand
+    const tStart = performance.now()
+    const rawData = getTextureRawData(name, { width, height, mips, format })
+    const t1 = performance.now()
+    if (!rawData) return new Response('Read failed', { status: 500 })
+
+    try {
+      const rgbaPixels = decodeBCn(rawData, width, height, format)
+      const t2 = performance.now()
+
+      // Store in preload cache for future access
+      const filepath = currentParser.filepath
+      if (!texturePreloadCache.has(filepath)) {
+        texturePreloadCache.set(filepath, new Map())
+      }
+      const sizeBytes = rgbaPixels.byteLength
+      texturePreloadCache.get(filepath)!.set(name, {
+        rgbaPixels, width, height, mips, format, sizeBytes
+      })
+      totalPreloadBytes += sizeBytes
+
+      const metaJson = Buffer.from(JSON.stringify(meta), 'utf-8')
+      const header = Buffer.alloc(4)
+      header.writeUInt32LE(metaJson.length, 0)
+      const body = Buffer.concat([header, metaJson, Buffer.from(rgbaPixels.buffer, rgbaPixels.byteOffset, rgbaPixels.byteLength)])
+      console.log(`${ts()} [preview] ${name}: read=${(t1 - tStart).toFixed(0)}ms, decode=${(t2 - t1).toFixed(0)}ms, total=${(t2 - tStart).toFixed(0)}ms (${width}x${height} fmt=${format}, ${(body.length / 1024 / 1024).toFixed(1)}MB)`)
+
+      return new Response(body, {
+        status: 200, headers: { 'Content-Type': 'application/octet-stream' }
+      })
+    } catch (e) {
+      console.error(`Failed to decode texture ${name}:`, e)
+      return new Response('Decode failed', { status: 500 })
+    }
+  })
+
   initPreferences(app.getPath('userData'))
   initOodle()
   initSharedData()

@@ -61,15 +61,18 @@ function decodeBC4Block(block: Buffer, offset: number, out: Uint8Array, outOffse
     alphas[7] = 255
   }
 
-  // Read 48-bit index table (6 bytes starting at offset+2)
-  let bits = 0n
-  for (let i = 0; i < 6; i++) {
-    bits |= BigInt(block[offset + 2 + i]) << BigInt(i * 8)
-  }
+  // Read 48-bit index table as two 24-bit halves (avoids slow BigInt)
+  const lo = block[offset + 2] | (block[offset + 3] << 8) | (block[offset + 4] << 16)
+  const hi = block[offset + 5] | (block[offset + 6] << 8) | (block[offset + 7] << 16)
 
   for (let y = 0; y < 4; y++) {
     for (let x = 0; x < 4; x++) {
-      const idx = Number((bits >> BigInt(3 * (y * 4 + x))) & 7n)
+      const pixIdx = y * 4 + x
+      const bitOffset = pixIdx * 3
+      // First 8 pixels (bits 0-23) from lo, next 8 (bits 24-47) from hi
+      const idx = bitOffset < 24
+        ? (lo >> bitOffset) & 7
+        : (hi >> (bitOffset - 24)) & 7
       const val = alphas[idx]
       const pix = outOffset + y * stride + x * 4
       out[pix]     = val
@@ -120,13 +123,15 @@ function decodeBC4Channel(block: Buffer, offset: number, out: Uint8Array) {
     alphas[7] = 255
   }
 
-  let bits = 0n
-  for (let i = 0; i < 6; i++) {
-    bits |= BigInt(block[offset + 2 + i]) << BigInt(i * 8)
-  }
+  // Read 48-bit index table as two 24-bit halves (avoids slow BigInt)
+  const lo = block[offset + 2] | (block[offset + 3] << 8) | (block[offset + 4] << 16)
+  const hi = block[offset + 5] | (block[offset + 6] << 8) | (block[offset + 7] << 16)
 
   for (let i = 0; i < 16; i++) {
-    const idx = Number((bits >> BigInt(3 * i)) & 7n)
+    const bitOffset = i * 3
+    const idx = bitOffset < 24
+      ? (lo >> bitOffset) & 7
+      : (hi >> (bitOffset - 24)) & 7
     out[i] = alphas[idx]
   }
 }
@@ -216,15 +221,31 @@ function initPartitionTables() {
   }
 }
 
-// Simple BC7 fallback: decode as grayscale from raw bytes (for when full decode is too complex)
-function decodeBC7BlockSimple(block: Buffer, offset: number, out: Uint8Array, outOffset: number, stride: number) {
+// Pre-allocated arrays for BC7 decoding (avoids per-block allocation)
+const _bc7_r = new Int32Array(6)
+const _bc7_g = new Int32Array(6)
+const _bc7_b = new Int32Array(6)
+const _bc7_a = new Int32Array(6)
+const _bc7_idx = new Uint8Array(16)
+const _bc7_isAnchor = new Uint8Array(16)
+
+// Hoisted weight tables
+const BC7_WEIGHTS_2 = [0, 21, 43, 64]
+const BC7_WEIGHTS_3 = [0, 9, 18, 27, 37, 46, 55, 64]
+const BC7_WEIGHTS_4 = [0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64]
+const BC7_1SUBSET = [0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0]
+
+// Bit mask lookup: masks[n] = (1 << n) - 1
+const _masks = new Int32Array(17)
+for (let i = 0; i < 17; i++) _masks[i] = (1 << i) - 1
+
+function decodeBC7Block(block: Buffer, offset: number, out: Uint8Array, outOffset: number, stride: number) {
   // Determine mode from lowest set bit
-  let modeByte = block[offset]
+  const modeByte = block[offset]
   let mode = 0
   while (mode < 8 && !(modeByte & (1 << mode))) mode++
 
   if (mode >= 8) {
-    // Invalid block — fill with magenta
     for (let y = 0; y < 4; y++) {
       for (let x = 0; x < 4; x++) {
         const pix = outOffset + y * stride + x * 4
@@ -234,113 +255,133 @@ function decodeBC7BlockSimple(block: Buffer, offset: number, out: Uint8Array, ou
     return
   }
 
-  // Use a bit reader for the 128-bit block
-  const bits = new DataView(block.buffer, block.byteOffset + offset, 16)
-  let bitPos = mode + 1 // skip mode bits
+  // Direct array access for bit reading (no DataView, no closure)
+  let bitPos = mode + 1
+  const bo = block.byteOffset + offset
 
-  function readBits(count: number): number {
-    let val = 0
-    for (let i = 0; i < count; i++) {
-      const byteIdx = (bitPos + i) >> 3
-      if (byteIdx >= 16) break // safety: don't read past the 128-bit block
-      const bitIdx = (bitPos + i) & 7
-      if (bits.getUint8(byteIdx) & (1 << bitIdx)) {
-        val |= 1 << i
-      }
-    }
-    bitPos += count
-    return val
-  }
+  // Inline bit reader using direct Buffer (Uint8Array) access
+  const buf = block.buffer
+  const bytes = new Uint8Array(buf, bo, 16)
 
   const modeInfo = BC7_MODES[mode]
-  const partition = modeInfo.pb > 0 ? readBits(modeInfo.pb > 4 ? 6 : 4) : 0
-
-  // Read rotation and index selection bits
-  const rotation = modeInfo.rb > 0 ? readBits(modeInfo.rb) : 0
-  const indexSel = modeInfo.isb > 0 ? readBits(1) : 0
-
-  // Read color endpoints
   const numEndpoints = modeInfo.ns * 2
-  const r = new Uint8Array(numEndpoints)
-  const g = new Uint8Array(numEndpoints)
-  const b = new Uint8Array(numEndpoints)
-  const a = new Uint8Array(numEndpoints)
 
-  for (let i = 0; i < numEndpoints; i++) r[i] = readBits(modeInfo.cb)
-  for (let i = 0; i < numEndpoints; i++) g[i] = readBits(modeInfo.cb)
-  for (let i = 0; i < numEndpoints; i++) b[i] = readBits(modeInfo.cb)
-  if (modeInfo.ab > 0) {
-    for (let i = 0; i < numEndpoints; i++) a[i] = readBits(modeInfo.ab)
+  // readBits inlined as local function referencing outer vars
+  let _byteIdx: number, _bitIdx: number, _raw: number
+
+  // Partition
+  let partition = 0
+  if (modeInfo.pb > 0) {
+    const count = modeInfo.pb > 4 ? 6 : 4
+    _byteIdx = bitPos >> 3; _bitIdx = bitPos & 7
+    _raw = bytes[_byteIdx]; if (_bitIdx + count > 8) _raw |= bytes[_byteIdx + 1] << 8
+    bitPos += count
+    partition = (_raw >> _bitIdx) & _masks[count]
+  }
+
+  // Rotation and index selection
+  let rotation = 0
+  if (modeInfo.rb > 0) {
+    _byteIdx = bitPos >> 3; _bitIdx = bitPos & 7
+    _raw = bytes[_byteIdx]; if (_bitIdx + 2 > 8) _raw |= bytes[_byteIdx + 1] << 8
+    bitPos += modeInfo.rb
+    rotation = (_raw >> _bitIdx) & _masks[modeInfo.rb]
+  }
+  if (modeInfo.isb > 0) {
+    _byteIdx = bitPos >> 3; _bitIdx = bitPos & 7
+    bitPos += 1
+  }
+
+  // Helper: read N bits from bitstream
+  function rb(count: number): number {
+    _byteIdx = bitPos >> 3; _bitIdx = bitPos & 7
+    _raw = bytes[_byteIdx]
+    if (_bitIdx + count > 8) _raw |= bytes[_byteIdx + 1] << 8
+    if (_bitIdx + count > 16) _raw |= bytes[_byteIdx + 2] << 16
+    bitPos += count
+    return (_raw >> _bitIdx) & _masks[count]
+  }
+
+  // Read color endpoints into pre-allocated arrays
+  const cb = modeInfo.cb
+  const ab = modeInfo.ab
+  for (let i = 0; i < numEndpoints; i++) _bc7_r[i] = rb(cb)
+  for (let i = 0; i < numEndpoints; i++) _bc7_g[i] = rb(cb)
+  for (let i = 0; i < numEndpoints; i++) _bc7_b[i] = rb(cb)
+  if (ab > 0) {
+    for (let i = 0; i < numEndpoints; i++) _bc7_a[i] = rb(ab)
   } else {
-    a.fill(255)
+    for (let i = 0; i < numEndpoints; i++) _bc7_a[i] = 255
   }
 
   // Read P-bits
   if (modeInfo.epb > 0) {
     for (let i = 0; i < numEndpoints; i++) {
-      const pbit = readBits(1)
-      r[i] = (r[i] << 1) | pbit
-      g[i] = (g[i] << 1) | pbit
-      b[i] = (b[i] << 1) | pbit
-      if (modeInfo.ab > 0) a[i] = (a[i] << 1) | pbit
+      const pbit = rb(1)
+      _bc7_r[i] = (_bc7_r[i] << 1) | pbit
+      _bc7_g[i] = (_bc7_g[i] << 1) | pbit
+      _bc7_b[i] = (_bc7_b[i] << 1) | pbit
+      if (ab > 0) _bc7_a[i] = (_bc7_a[i] << 1) | pbit
     }
   } else if (modeInfo.spb > 0) {
     for (let i = 0; i < numEndpoints; i += 2) {
-      const pbit = readBits(1)
-      r[i] = (r[i] << 1) | pbit; r[i + 1] = (r[i + 1] << 1) | pbit
-      g[i] = (g[i] << 1) | pbit; g[i + 1] = (g[i + 1] << 1) | pbit
-      b[i] = (b[i] << 1) | pbit; b[i + 1] = (b[i + 1] << 1) | pbit
-      if (modeInfo.ab > 0) {
-        a[i] = (a[i] << 1) | pbit; a[i + 1] = (a[i + 1] << 1) | pbit
+      const pbit = rb(1)
+      _bc7_r[i] = (_bc7_r[i] << 1) | pbit; _bc7_r[i + 1] = (_bc7_r[i + 1] << 1) | pbit
+      _bc7_g[i] = (_bc7_g[i] << 1) | pbit; _bc7_g[i + 1] = (_bc7_g[i + 1] << 1) | pbit
+      _bc7_b[i] = (_bc7_b[i] << 1) | pbit; _bc7_b[i + 1] = (_bc7_b[i + 1] << 1) | pbit
+      if (ab > 0) {
+        _bc7_a[i] = (_bc7_a[i] << 1) | pbit; _bc7_a[i + 1] = (_bc7_a[i + 1] << 1) | pbit
       }
     }
   }
 
   // Expand endpoints to 8 bits
-  const totalColorBits = modeInfo.cb + (modeInfo.epb > 0 || modeInfo.spb > 0 ? 1 : 0)
-  const totalAlphaBits = modeInfo.ab > 0 ? modeInfo.ab + (modeInfo.epb > 0 || modeInfo.spb > 0 ? 1 : 0) : 8
+  const hasPbits = modeInfo.epb > 0 || modeInfo.spb > 0
+  const totalColorBits = cb + (hasPbits ? 1 : 0)
+  const totalAlphaBits = ab > 0 ? ab + (hasPbits ? 1 : 0) : 8
+  const cShift = 8 - totalColorBits
+  const cBack = 2 * totalColorBits - 8
+  const aShift = 8 - totalAlphaBits
+  const aBack = 2 * totalAlphaBits - 8
 
   for (let i = 0; i < numEndpoints; i++) {
-    r[i] = (r[i] << (8 - totalColorBits)) | (r[i] >> (2 * totalColorBits - 8))
-    g[i] = (g[i] << (8 - totalColorBits)) | (g[i] >> (2 * totalColorBits - 8))
-    b[i] = (b[i] << (8 - totalColorBits)) | (b[i] >> (2 * totalColorBits - 8))
-    if (modeInfo.ab > 0) {
-      a[i] = (a[i] << (8 - totalAlphaBits)) | (a[i] >> (2 * totalAlphaBits - 8))
+    _bc7_r[i] = (_bc7_r[i] << cShift) | (_bc7_r[i] >> cBack)
+    _bc7_g[i] = (_bc7_g[i] << cShift) | (_bc7_g[i] >> cBack)
+    _bc7_b[i] = (_bc7_b[i] << cShift) | (_bc7_b[i] >> cBack)
+    if (ab > 0) {
+      _bc7_a[i] = (_bc7_a[i] << aShift) | (_bc7_a[i] >> aBack)
     }
   }
 
   // Get partition assignment
+  const partIdx = partition % 64
   let partitionTable: number[]
   if (modeInfo.ns === 1) {
-    partitionTable = [0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0]
+    partitionTable = BC7_1SUBSET
   } else if (modeInfo.ns === 2) {
-    partitionTable = BC7_PARTITION_2[partition % 64] || new Array(16).fill(0)
+    partitionTable = BC7_PARTITION_2[partIdx] || BC7_1SUBSET
   } else {
-    partitionTable = BC7_PARTITION_3[partition % 64] || new Array(16).fill(0)
+    partitionTable = BC7_PARTITION_3[partIdx] || BC7_1SUBSET
   }
 
-  // BC7 interpolation weights
-  const weights2 = [0, 21, 43, 64]
-  const weights3 = [0, 9, 18, 27, 37, 46, 55, 64]
-  const weights4 = [0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64]
+  const weightsTable = modeInfo.ib === 2 ? BC7_WEIGHTS_2 : modeInfo.ib === 3 ? BC7_WEIGHTS_3 : BC7_WEIGHTS_4
 
-  const weightsTable = modeInfo.ib === 2 ? weights2 : modeInfo.ib === 3 ? weights3 : weights4
-
-  // Determine anchor indices (anchors get 1 fewer index bit)
-  const anchors = new Set<number>()
-  anchors.add(0) // subset 0 anchor is always pixel 0
+  // Build anchor flags as flat array (much faster than Set.has)
+  _bc7_isAnchor.fill(0)
+  _bc7_isAnchor[0] = 1
   if (modeInfo.ns === 2) {
-    anchors.add(BC7_ANCHOR_2[partition % 64])
+    _bc7_isAnchor[BC7_ANCHOR_2[partIdx]] = 1
   } else if (modeInfo.ns === 3) {
-    anchors.add(BC7_ANCHOR_3A[partition % 64])
-    anchors.add(BC7_ANCHOR_3B[partition % 64])
+    _bc7_isAnchor[BC7_ANCHOR_3A[partIdx]] = 1
+    _bc7_isAnchor[BC7_ANCHOR_3B[partIdx]] = 1
   }
 
-  // Read index data (anchor indices have 1 fewer bit, MSB implicitly 0)
-  const indices = new Uint8Array(16)
+  // Read index data
+  const ib = modeInfo.ib
+  const ibMinus1 = ib - 1
   for (let i = 0; i < 16; i++) {
-    const bits2 = anchors.has(i) ? modeInfo.ib - 1 : modeInfo.ib
-    indices[i] = bits2 > 0 ? readBits(bits2) : 0
+    const bits2 = _bc7_isAnchor[i] ? ibMinus1 : ib
+    _bc7_idx[i] = bits2 > 0 ? rb(bits2) : 0
   }
 
   // Interpolate and output
@@ -350,13 +391,14 @@ function decodeBC7BlockSimple(block: Buffer, offset: number, out: Uint8Array, ou
       const subset = partitionTable[i]
       const e0 = subset * 2
       const e1 = subset * 2 + 1
-      const w = weightsTable[indices[i] % weightsTable.length]
+      const w = weightsTable[_bc7_idx[i] % weightsTable.length]
+      const w2 = 64 - w
 
       const pix = outOffset + y * stride + x * 4
-      out[pix]     = ((64 - w) * r[e0] + w * r[e1] + 32) >> 6
-      out[pix + 1] = ((64 - w) * g[e0] + w * g[e1] + 32) >> 6
-      out[pix + 2] = ((64 - w) * b[e0] + w * b[e1] + 32) >> 6
-      out[pix + 3] = ((64 - w) * a[e0] + w * a[e1] + 32) >> 6
+      out[pix]     = (w2 * _bc7_r[e0] + w * _bc7_r[e1] + 32) >> 6
+      out[pix + 1] = (w2 * _bc7_g[e0] + w * _bc7_g[e1] + 32) >> 6
+      out[pix + 2] = (w2 * _bc7_b[e0] + w * _bc7_b[e1] + 32) >> 6
+      out[pix + 3] = (w2 * _bc7_a[e0] + w * _bc7_a[e1] + 32) >> 6
 
       // Apply rotation
       if (rotation === 1) { const t = out[pix + 3]; out[pix + 3] = out[pix]; out[pix] = t }
@@ -495,7 +537,7 @@ export function decodeBCn(data: Buffer, width: number, height: number, dxgiFmt: 
           decodeBC5Block(data, blockOffset, out, outOffset, stride)
           break
         case 98: case 99: // BC7
-          decodeBC7BlockSimple(data, blockOffset, out, outOffset, stride)
+          decodeBC7Block(data, blockOffset, out, outOffset, stride)
           break
         default:
           // BC2, BC3, BC6H — fill with pattern to indicate unsupported
