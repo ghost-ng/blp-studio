@@ -16,7 +16,9 @@
     "cli": "npx tsx scripts/cli.ts"
   },
   "dependencies": {
-    "koffi": "^2.9.0"
+    "@types/three": "^0.182.0",
+    "koffi": "^2.9.0",
+    "three": "^0.182.0"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",

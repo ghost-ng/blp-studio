@@ -89,17 +89,55 @@ export interface ElectronAPI {
   getDepText: (modId: string) => Promise<string | null>
   getModinfoText: (modId: string, modName: string) => Promise<string | null>
   saveTextFile: (text: string, defaultFilename: string, filterName: string, filterExt: string) => Promise<{ filepath: string; size: number } | null>
-  parseWwiseBank: (name: string) => Promise<{ bankVersion: number; bankId: number; embeddedFiles: { id: number; size: number }[] } | null>
-  extractWwiseAudio: (name: string, fileId: number) => Promise<{ data: Uint8Array; id: number } | null>
+  parseWwiseBank: (name: string) => Promise<{
+    bankVersion: number
+    bankId: number
+    embeddedFiles: { id: number; size: number }[]
+    hirc: {
+      totalCount: number
+      sounds: { id: number; sourceId: number; streamType: number; pluginId: number }[]
+      actions: { id: number; actionType: number; actionTypeName: string; referenceId: number }[]
+      events: { id: number; actionIds: number[] }[]
+      otherTypeCounts: { type: number; typeName: string; count: number }[]
+    } | null
+    stid: { id: number; name: string }[] | null
+    fileLabels: { fileId: number; eventIds: number[]; labels: string[] }[]
+  } | null>
+  extractWwiseAudio: (name: string, fileId: number, outputDir?: string) => Promise<{ data: Uint8Array; id: number } | null>
   extractAllWwiseAudio: (name: string, outputDir: string) => Promise<{ success: number; failed: number }>
   extractBlobsByType: (blobType: number, outputDir: string) => Promise<{ success: number; failed: number }>
   decodeWwiseAudio: (audioData: Uint8Array) => Promise<Uint8Array | null>
+  previewWem: (name: string, fileId: number) => Promise<Uint8Array | null>
   exportTexturesBatch: (names: string[], outputDir: string, format: string, quality?: number) => Promise<{ success: number; failed: number }>
   getThumbnails: (names: string[]) => Promise<Record<string, { width: number; height: number; rgbaPixels: Uint8Array }>>
   closeCache: (filepath: string) => Promise<void>
   logTiming: (msg: string) => Promise<void>
   onPreloadProgress: (callback: (info: { current: number; total: number }) => void) => () => void
   onDdsLoadFile: (callback: (filepath: string) => void) => () => void
+  parseSkeleton: (name: string) => Promise<{
+    boneCount: number
+    bones: {
+      index: number
+      name: string
+      parentIndex: number
+      localPosition: number[]
+      localRotation: number[]
+      worldPosition: number[]
+      worldRotation: number[]
+    }[]
+  } | null>
+  parseAnimation: (name: string) => Promise<{
+    fps: number
+    frameCount: number
+    boneCount: number
+    duration: number
+    name: string
+    isV0: boolean
+    isWorldSpace: boolean
+    keyframes: { rotation: number[]; position: number[]; scale: number[] }[][] | null
+  } | null>
+  listAnimations: (boneCount: number) => Promise<{ name: string; size: number }[]>
+  listSkeletons: () => Promise<{ name: string; size: number }[]>
 }
 
 const api: ElectronAPI = {
@@ -174,10 +212,11 @@ const api: ElectronAPI = {
   getModinfoText: (modId, modName) => ipcRenderer.invoke('blp:get-modinfo-text', modId, modName),
   saveTextFile: (text, defaultFilename, filterName, filterExt) => ipcRenderer.invoke('blp:save-text-file', text, defaultFilename, filterName, filterExt),
   parseWwiseBank: (name) => ipcRenderer.invoke('asset:parse-wwise', name),
-  extractWwiseAudio: (name, fileId) => ipcRenderer.invoke('asset:extract-wwise-audio', name, fileId),
+  extractWwiseAudio: (name, fileId, outputDir?) => ipcRenderer.invoke('asset:extract-wwise-audio', name, fileId, outputDir),
   extractAllWwiseAudio: (name, outputDir) => ipcRenderer.invoke('asset:extract-all-wwise', name, outputDir),
   extractBlobsByType: (blobType, outputDir) => ipcRenderer.invoke('asset:extract-blobs-by-type', blobType, outputDir),
   decodeWwiseAudio: (audioData) => ipcRenderer.invoke('audio:decode-wwise', audioData),
+  previewWem: (name, fileId) => ipcRenderer.invoke('asset:preview-wem', name, fileId),
   exportTexturesBatch: (names, outputDir, format, quality?) => ipcRenderer.invoke('asset:export-textures-batch', names, outputDir, format, quality),
   getThumbnails: (names) => ipcRenderer.invoke('asset:thumbnails', names),
   closeCache: (filepath) => ipcRenderer.invoke('blp:close-cache', filepath),
@@ -192,6 +231,10 @@ const api: ElectronAPI = {
     ipcRenderer.on('dds:load-file', handler)
     return () => ipcRenderer.removeListener('dds:load-file', handler)
   },
+  parseSkeleton: (name) => ipcRenderer.invoke('asset:parse-skeleton', name),
+  parseAnimation: (name) => ipcRenderer.invoke('asset:parse-animation', name),
+  listAnimations: (boneCount) => ipcRenderer.invoke('asset:list-animations', boneCount),
+  listSkeletons: () => ipcRenderer.invoke('asset:list-skeletons'),
 }
 
 contextBridge.exposeInMainWorld('electronAPI', api)

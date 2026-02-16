@@ -33,6 +33,12 @@ const TYPE_LABELS: Record<string, { label: string; icon: string }> = {
   sound: { label: 'Sounds', icon: '\u{1F50A}' },
 }
 
+const BLOB_TYPE_NAMES: Record<number, string> = {
+  0: 'heightmap', 1: 'blend_hm', 2: 'idmap', 3: 'material_id',
+  5: 'animation', 6: 'stateset', 7: 'audio', 9: 'blend_mesh',
+  11: 'mesh', 12: 'skeleton', 13: 'collision',
+}
+
 interface ContextMenuState {
   x: number
   y: number
@@ -61,6 +67,7 @@ export function AssetTree({ assets, selectedAsset, selectedAssets, onSelectAsset
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  const listRef = useRef<HTMLDivElement>(null)
   const lastClickedRef = useRef<string | null>(null)
   const [viewMode, setViewMode] = useState<ViewMode>('list')
   const [thumbnails, setThumbnails] = useState<Map<string, string>>(new Map())
@@ -204,6 +211,46 @@ export function AssetTree({ assets, selectedAsset, selectedAssets, onSelectAsset
     }
   }, [contextMenu])
 
+  // Arrow key navigation through flat visible list
+  useEffect(() => {
+    const handleArrowKey = (e: KeyboardEvent) => {
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
+      // Don't intercept if focus is on an input/textarea
+      const tag = (e.target as HTMLElement)?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return
+      if (flatVisibleList.length === 0) return
+
+      e.preventDefault()
+      const currentIdx = selectedAsset
+        ? flatVisibleList.findIndex(a => a.name === selectedAsset.name)
+        : -1
+
+      let nextIdx: number
+      if (e.key === 'ArrowDown') {
+        nextIdx = currentIdx < 0 ? 0 : Math.min(currentIdx + 1, flatVisibleList.length - 1)
+      } else {
+        nextIdx = currentIdx < 0 ? 0 : Math.max(currentIdx - 1, 0)
+      }
+
+      if (nextIdx === currentIdx && currentIdx >= 0) return
+
+      const nextAsset = flatVisibleList[nextIdx]
+      onSelectAsset(nextAsset)
+      onSelectionChange(new Set([nextAsset.name]))
+      lastClickedRef.current = nextAsset.name
+
+      // Scroll the item into view
+      const container = listRef.current
+      if (container) {
+        const el = container.querySelector(`[data-asset-name="${CSS.escape(nextAsset.name)}"]`) as HTMLElement | null
+        el?.scrollIntoView({ block: 'nearest' })
+      }
+    }
+
+    document.addEventListener('keydown', handleArrowKey)
+    return () => document.removeEventListener('keydown', handleArrowKey)
+  }, [flatVisibleList, selectedAsset, onSelectAsset, onSelectionChange])
+
   const selectedTextureNames = useMemo(() => {
     return [...selectedAssets].filter(name =>
       assets.find(a => a.name === name && a.type === 'texture')
@@ -217,9 +264,12 @@ export function AssetTree({ assets, selectedAsset, selectedAssets, onSelectAsset
     const rawSize = asset.metadata.rawSize as number | undefined
     const dims = asset.type === 'texture' && asset.metadata.width && asset.metadata.height
       ? `${asset.metadata.width}x${asset.metadata.height}` : null
+    const blobLabel = asset.type === 'blob' && typeof asset.metadata.blobType === 'number'
+      ? BLOB_TYPE_NAMES[asset.metadata.blobType] ?? `type_${asset.metadata.blobType}` : null
     return (
       <div
         key={asset.name}
+        data-asset-name={asset.name}
         className={`tree-item flex items-center px-6 py-1 cursor-pointer truncate select-none ${
           isPrimary ? 'selected' : isMultiSelected ? 'multi-selected' : ''
         }`}
@@ -229,9 +279,9 @@ export function AssetTree({ assets, selectedAsset, selectedAssets, onSelectAsset
       >
         {isReplaced && <span className="text-amber-400 mr-1 text-xs flex-shrink-0">*</span>}
         <span className={`truncate ${isReplaced ? 'text-amber-300' : 'text-gray-300'}`}>{asset.name}</span>
-        {(dims || rawSize) && (
+        {(dims || blobLabel || rawSize) && (
           <span className="ml-auto pl-2 text-[10px] text-gray-600 flex-shrink-0">
-            {dims}{rawSize ? ` ${formatSize(rawSize)}` : ''}
+            {dims}{blobLabel}{rawSize ? ` ${formatSize(rawSize)}` : ''}
           </span>
         )}
       </div>
@@ -247,6 +297,7 @@ export function AssetTree({ assets, selectedAsset, selectedAssets, onSelectAsset
     return (
       <div
         key={asset.name}
+        data-asset-name={asset.name}
         className={`flex flex-col items-center p-1 rounded cursor-pointer transition-colors select-none ${
           isPrimary ? 'bg-blue-500/25 ring-1 ring-blue-500' :
           isMultiSelected ? 'bg-blue-500/20 ring-1 ring-blue-400/40' :
@@ -341,7 +392,7 @@ export function AssetTree({ assets, selectedAsset, selectedAssets, onSelectAsset
       )}
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto text-sm">
+      <div ref={listRef} className="flex-1 overflow-y-auto text-sm">
         {assets.length === 0 ? (
           <div className="p-4 text-gray-500 text-center">
             No file loaded

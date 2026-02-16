@@ -14,7 +14,8 @@ import {
 } from '../core/game-detect'
 import { decodeBCn } from '../core/bcn-decoder'
 import { generateModinfo, generateDep, sanitizeModId } from '../core/mod-manifest'
-import { parseWwiseBank, extractWemFile } from '../core/wwise-bank'
+import { parseWwiseBank, extractWemFile, setWwiseBankLogger, getActionTypeName, getHircTypeName } from '../core/wwise-bank'
+import { parseSkeleton, parseAnimation } from '../core/skel-parser'
 import { initPreferences, loadPreferences, setTheme, updatePreferences, addRecentFile, clearRecentFiles } from '../core/preferences'
 import { initLogger, log, warn, error as logError, getLogPath } from '../core/logger'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, unlinkSync } from 'fs'
@@ -1871,10 +1872,57 @@ function setupIPC() {
       }
 
       const info = parseWwiseBank(finalData)
+
+      // Log HIRC summary for diagnostics
+      if (info.hirc) {
+        log(`[wwise] ${name}: HIRC has ${info.hirc.sounds.length} sounds, ${info.hirc.actions.length} actions, ${info.hirc.events.length} events`)
+        if (info.hirc.otherTypeCounts.length > 0) {
+          log(`[wwise]   other types: ${info.hirc.otherTypeCounts.map(([t, c]) => `${getHircTypeName(t)}=${c}`).join(', ')}`)
+        }
+      } else {
+        log(`[wwise] ${name}: no HIRC section (media-only bank)`)
+      }
+
+      if (info.fileLabels.length > 0) {
+        const linked = info.fileLabels.filter(l => l.eventIds.length > 0)
+        log(`[wwise] ${name}: ${linked.length}/${info.embeddedFiles.length} files linked to events`)
+      }
+
+      // Return IPC-safe structure (no Maps, no circular refs)
       return {
         bankVersion: info.bankVersion,
         bankId: info.bankId,
         embeddedFiles: info.embeddedFiles.map(f => ({ id: f.id, size: f.size })),
+        hirc: info.hirc ? {
+          totalCount: info.hirc.totalCount,
+          sounds: info.hirc.sounds.map(s => ({
+            id: s.id,
+            sourceId: s.sourceId,
+            streamType: s.streamType,
+            pluginId: s.pluginId,
+          })),
+          actions: info.hirc.actions.map(a => ({
+            id: a.id,
+            actionType: a.actionType,
+            actionTypeName: getActionTypeName(a.actionType),
+            referenceId: a.referenceId,
+          })),
+          events: info.hirc.events.map(e => ({
+            id: e.id,
+            actionIds: e.actionIds,
+          })),
+          otherTypeCounts: info.hirc.otherTypeCounts.map(([t, c]) => ({
+            type: t,
+            typeName: getHircTypeName(t),
+            count: c,
+          })),
+        } : null,
+        stid: info.stid,
+        fileLabels: info.fileLabels.map(l => ({
+          fileId: l.fileId,
+          eventIds: l.eventIds,
+          labels: l.labels,
+        })),
       }
     } catch (e) {
       logError(`Failed to parse Wwise bank ${name}`, e)
@@ -1883,7 +1931,8 @@ function setupIPC() {
   })
 
   // ---- Extract single .wem from Wwise SoundBank ----
-  ipcMain.handle('asset:extract-wwise-audio', async (_e, name: string, fileId: number) => {
+  // If outputDir is provided, writes the file to disk. Always returns { data, id }.
+  ipcMain.handle('asset:extract-wwise-audio', async (_e, name: string, fileId: number, outputDir?: string) => {
     if (!isString(name) || typeof fileId !== 'number' || !currentParser) return null
 
     const civbigPath = sdIndex.get(name)
@@ -1910,6 +1959,15 @@ function setupIPC() {
       if (!file) return null
 
       const wemData = extractWemFile(finalData, file)
+
+      // Write to disk if outputDir is provided
+      if (outputDir && isString(outputDir)) {
+        if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true })
+        const outPath = join(outputDir, `${file.id}.wem`)
+        writeFileSync(outPath, wemData)
+        log(`[wwise] extracted ${file.id}.wem (${wemData.length} bytes) -> ${outPath}`)
+      }
+
       return { data: wemData, id: file.id }
     } catch (e) {
       logError(`Failed to extract Wwise audio ${fileId} from ${name}`, e)
@@ -2002,6 +2060,77 @@ function setupIPC() {
     }
   })
 
+  // ---- Preview single .wem from SoundBank: extract + decode to WAV in one call ----
+  ipcMain.handle('asset:preview-wem', async (_e, name: string, fileId: number): Promise<Buffer | null> => {
+    if (!isString(name) || typeof fileId !== 'number' || !currentParser) return null
+    log(`[wwise] preview wem: ${name} fileId=${fileId}`)
+
+    const civbigPath = sdIndex.get(name)
+    if (!civbigPath) {
+      warn(`[wwise] preview-wem: asset "${name}" not found in index`)
+      return null
+    }
+
+    try {
+      // Step 1: Extract the .wem from the bank
+      const { data } = readCivbig(civbigPath)
+      let finalData = data
+      if (OodleDecompressor.isOodleCompressed(data) && oodle) {
+        let storedSize = 0
+        for (const alloc of currentParser.iterEntriesByType('BLP::SoundBankEntry')) {
+          const obj = currentParser.deserializeAlloc(alloc)
+          if (obj.m_Name === name) {
+            storedSize = (obj.m_nSize as number) || 0
+            break
+          }
+        }
+        const raw = oodle.decompress(data, storedSize || data.length * 4)
+        if (raw) finalData = raw
+      }
+
+      const info = parseWwiseBank(finalData)
+      const file = info.embeddedFiles.find(f => f.id === fileId)
+      if (!file) {
+        warn(`[wwise] preview-wem: fileId ${fileId} not found in bank ${name}`)
+        return null
+      }
+
+      const wemData = extractWemFile(finalData, file)
+      log(`[wwise] preview-wem: extracted ${wemData.length} bytes for fileId=${fileId}`)
+
+      // Step 2: Decode to PCM WAV via vgmstream
+      const vgmstreamPath = findVgmstream()
+      if (!vgmstreamPath) {
+        warn('[wwise] preview-wem: vgmstream-cli.exe not found, cannot decode')
+        return null
+      }
+
+      const id = randomBytes(8).toString('hex')
+      const tempIn = join(tmpdir(), `blp-wem-${id}.wem`)
+      const tempOut = join(tmpdir(), `blp-pcm-${id}.wav`)
+
+      try {
+        writeFileSync(tempIn, wemData)
+        await new Promise<void>((resolve, reject) => {
+          execFile(vgmstreamPath, ['-o', tempOut, tempIn], {
+            timeout: 30000,
+            cwd: join(vgmstreamPath, '..'),
+          }, (err) => err ? reject(err) : resolve())
+        })
+
+        const pcmData = readFileSync(tempOut)
+        log(`[wwise] preview-wem: decoded to ${pcmData.length} bytes PCM WAV`)
+        return pcmData
+      } finally {
+        try { unlinkSync(tempIn) } catch { /* ignore */ }
+        try { unlinkSync(tempOut) } catch { /* ignore */ }
+      }
+    } catch (e) {
+      logError(`[wwise] preview-wem failed for ${name} fileId=${fileId}`, e)
+      return null
+    }
+  })
+
   // ---- Extract all blobs of a specific type ----
   ipcMain.handle('asset:extract-blobs-by-type', async (_e, blobType: number, outputDir: string) => {
     if (typeof blobType !== 'number' || !isString(outputDir) || !currentParser) return { success: 0, failed: 0 }
@@ -2072,6 +2201,152 @@ function setupIPC() {
       logError('Failed to copy image to clipboard', e)
       return false
     }
+  })
+
+  // ---- Skeleton / Animation parsing ----
+
+  // Cache last parsed skeleton rest-pose for V1 animation decoding
+  let lastSkeletonRestPose: { localPosition: [number, number, number]; localRotation: [number, number, number, number]; worldPosition: [number, number, number]; worldRotation: [number, number, number, number]; parentIndex: number }[] | null = null
+
+  ipcMain.handle('asset:parse-skeleton', async (_e, name: string) => {
+    if (!isString(name) || !currentParser) return null
+    log(`[skel] parsing skeleton: ${name}`)
+
+    const civbigPath = sdIndex.get(name)
+    if (!civbigPath) return null
+
+    try {
+      const { data } = readCivbig(civbigPath)
+      let finalData = data
+
+      // Get stored size for decompression
+      let storedSize = 0
+      for (const alloc of currentParser.iterEntriesByType('BLP::BlobEntry')) {
+        const obj = currentParser.deserializeAlloc(alloc)
+        if (obj.m_Name === name) {
+          storedSize = (obj.m_nSize as number) || 0
+          break
+        }
+      }
+
+      if (OodleDecompressor.isOodleCompressed(data) && oodle) {
+        const raw = oodle.decompress(data, storedSize || data.length * 4)
+        if (raw) finalData = raw
+      }
+
+      const parsed = parseSkeleton(finalData)
+      if (!parsed) {
+        warn(`[skel] failed to parse skeleton: ${name}`)
+        return null
+      }
+
+      log(`[skel] parsed ${parsed.boneCount} bones from ${name}`)
+      // Cache rest pose for V1 animation decoding
+      lastSkeletonRestPose = parsed.bones.map(b => ({
+        localPosition: b.localPosition,
+        localRotation: b.localRotation,
+        worldPosition: b.worldPosition,
+        worldRotation: b.worldRotation,
+        parentIndex: b.parentIndex,
+      }))
+      // Return IPC-safe plain objects
+      return {
+        boneCount: parsed.boneCount,
+        bones: parsed.bones.map(b => ({
+          index: b.index,
+          name: b.name,
+          parentIndex: b.parentIndex,
+          localPosition: Array.from(b.localPosition),
+          localRotation: Array.from(b.localRotation),
+          worldPosition: Array.from(b.worldPosition),
+          worldRotation: Array.from(b.worldRotation),
+        })),
+      }
+    } catch (e) {
+      logError(`[skel] error parsing skeleton: ${name}`, e)
+      return null
+    }
+  })
+
+  ipcMain.handle('asset:parse-animation', async (_e, name: string) => {
+    if (!isString(name) || !currentParser) return null
+    log(`[anim] parsing animation: ${name}`)
+
+    const civbigPath = sdIndex.get(name)
+    if (!civbigPath) return null
+
+    try {
+      const { data } = readCivbig(civbigPath)
+      let finalData = data
+
+      let storedSize = 0
+      for (const alloc of currentParser.iterEntriesByType('BLP::BlobEntry')) {
+        const obj = currentParser.deserializeAlloc(alloc)
+        if (obj.m_Name === name) {
+          storedSize = (obj.m_nSize as number) || 0
+          break
+        }
+      }
+
+      if (OodleDecompressor.isOodleCompressed(data) && oodle) {
+        const raw = oodle.decompress(data, storedSize || data.length * 4)
+        if (raw) finalData = raw
+      }
+
+      const parsed = parseAnimation(finalData, lastSkeletonRestPose ?? undefined)
+      if (!parsed) {
+        warn(`[anim] failed to parse animation: ${name}`)
+        return null
+      }
+
+      log(`[anim] parsed: ${parsed.name || name} fps=${parsed.fps} frames=${parsed.frameCount} bones=${parsed.boneCount} V0=${parsed.isV0} worldSpace=${parsed.isWorldSpace}`)
+      return {
+        fps: parsed.fps,
+        frameCount: parsed.frameCount,
+        boneCount: parsed.boneCount,
+        duration: parsed.duration,
+        name: parsed.name,
+        isV0: parsed.isV0,
+        isWorldSpace: parsed.isWorldSpace,
+        keyframes: parsed.keyframes,
+      }
+    } catch (e) {
+      logError(`[anim] error parsing animation: ${name}`, e)
+      return null
+    }
+  })
+
+  // List animations that match a skeleton's bone count (for pairing)
+  ipcMain.handle('asset:list-animations', async (_e, boneCount: number) => {
+    if (typeof boneCount !== 'number' || !currentParser) return []
+    log(`[anim] listing animations matching ${boneCount} bones`)
+
+    const results: { name: string; size: number }[] = []
+    for (const alloc of currentParser.iterEntriesByType('BLP::BlobEntry')) {
+      const obj = currentParser.deserializeAlloc(alloc)
+      const bt = (obj.m_nBlobType as number) ?? -1
+      if (bt !== 5) continue // animation blobs only
+
+      const name = obj.m_Name as string
+      const size = (obj.m_nSize as number) || 0
+      results.push({ name, size })
+    }
+
+    log(`[anim] found ${results.length} animation blobs total`)
+    return results
+  })
+
+  // List skeleton blobs in current BLP (for pairing with animations)
+  ipcMain.handle('asset:list-skeletons', async () => {
+    if (!currentParser) return []
+    const results: { name: string; size: number }[] = []
+    for (const alloc of currentParser.iterEntriesByType('BLP::BlobEntry')) {
+      const obj = currentParser.deserializeAlloc(alloc)
+      const bt = (obj.m_nBlobType as number) ?? -1
+      if (bt !== 12) continue // skeleton blobs only
+      results.push({ name: obj.m_Name as string, size: (obj.m_nSize as number) || 0 })
+    }
+    return results
   })
 }
 
@@ -2159,6 +2434,7 @@ app.whenReady().then(() => {
   })
 
   initLogger(app.getPath('userData'))
+  setWwiseBankLogger(log, warn)
   log(`BLP Studio v${app.getVersion()} starting (Electron ${process.versions.electron}, Node ${process.versions.node})`)
   log(`userData: ${app.getPath('userData')}`)
   initPreferences(app.getPath('userData'))

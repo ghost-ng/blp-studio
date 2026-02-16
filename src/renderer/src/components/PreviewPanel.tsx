@@ -2,6 +2,7 @@ import React, { useRef, useEffect, useState, useMemo, useCallback } from 'react'
 import { flushSync } from 'react-dom'
 import { ColorInspector, pickPixel, PickedColor } from './ColorInspector'
 import { MagnifierLoupe } from './MagnifierLoupe'
+import { SkeletonViewer } from './SkeletonViewer'
 
 interface AssetEntry {
   name: string
@@ -68,6 +69,29 @@ const BLOB_TYPE_EXT: Record<number, string> = {
   0: '.hmu', 1: '.bmu', 2: '.idm', 3: '.mid',
   5: '.anim', 6: '.ssid', 7: '.wav', 9: '.bmu',
   11: '.bin', 12: '.skel', 13: '.bin',
+}
+
+// --- Blob type descriptions (shown when preview not available) ---
+const BLOB_TYPE_DESC: Record<number, string> = {
+  0: 'Terrain elevation data used for rendering 3D landscape.',
+  1: 'Blended heightmap for smooth terrain transitions.',
+  2: 'Indexed color map that encodes terrain/feature type IDs.',
+  3: 'Material assignment map for terrain rendering.',
+  5: 'Skeletal animation with bone transforms per frame.',
+  6: 'State machine configuration controlling animation transitions.',
+  7: 'PCM audio waveform data.',
+  9: 'Blended mesh weights for terrain geometry.',
+  11: '3D geometry data (vertices, indices, normals, UVs).',
+  12: 'Bone hierarchy defining a skeleton for animation.',
+  13: 'Simplified geometry used for physics collision detection.',
+}
+
+// --- Asset type descriptions (shown when no data found) ---
+const ASSET_TYPE_DESC: Record<string, string> = {
+  texture: 'Image data used for surface rendering (diffuse, normal, specular maps).',
+  blob: 'Binary data blob — the specific format depends on its sub-type.',
+  gpu: 'GPU buffer containing vertex, index, or compute data uploaded directly to the graphics card.',
+  sound: 'Wwise SoundBank containing embedded audio events and streams.',
 }
 
 // --- File signature detection ---
@@ -574,8 +598,89 @@ function AudioPreview({ data, name }: { data: Uint8Array; name: string }) {
 }
 
 // --- Wwise SoundBank header preview ---
+
+/** Full parsed bank info from IPC (matches preload type) */
+interface WwiseBankParsed {
+  bankVersion: number
+  bankId: number
+  embeddedFiles: { id: number; size: number }[]
+  hirc: {
+    totalCount: number
+    sounds: { id: number; sourceId: number; streamType: number; pluginId: number }[]
+    actions: { id: number; actionType: number; actionTypeName: string; referenceId: number }[]
+    events: { id: number; actionIds: number[] }[]
+    otherTypeCounts: { type: number; typeName: string; count: number }[]
+  } | null
+  stid: { id: number; name: string }[] | null
+  fileLabels: { fileId: number; eventIds: number[]; labels: string[] }[]
+}
+
+/** Inline .wem audio player for a single embedded file */
+function WemPlayer({ assetName, fileId }: { assetName: string; fileId: number }) {
+  const [state, setState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [audioUrl, setAudioUrl] = useState<string | null>(null)
+  const mountedRef = useRef(true)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      if (audioUrl) URL.revokeObjectURL(audioUrl)
+    }
+  }, [audioUrl])
+
+  const handlePlay = useCallback(async () => {
+    if (state === 'loading') return
+    if (audioUrl) {
+      // Already decoded — toggle visibility by resetting
+      URL.revokeObjectURL(audioUrl)
+      setAudioUrl(null)
+      setState('idle')
+      return
+    }
+    setState('loading')
+    try {
+      const wavData = await window.electronAPI.previewWem(assetName, fileId)
+      if (!mountedRef.current) {
+        // Component unmounted while we were decoding — do not update state
+        return
+      }
+      if (wavData && wavData.length > 0) {
+        const blob = new Blob([wavData], { type: 'audio/wav' })
+        setAudioUrl(URL.createObjectURL(blob))
+        setState('ready')
+      } else {
+        setState('error')
+      }
+    } catch {
+      if (mountedRef.current) setState('error')
+    }
+  }, [assetName, fileId, audioUrl, state])
+
+  return (
+    <span className="inline-flex items-center gap-1">
+      <button
+        onClick={handlePlay}
+        disabled={state === 'loading'}
+        className={`text-xs px-1.5 py-0.5 rounded transition-colors ${
+          state === 'loading' ? 'text-gray-500 bg-gray-800' :
+          state === 'ready' ? 'text-green-400 hover:text-green-300 bg-green-900/30' :
+          state === 'error' ? 'text-red-400 bg-red-900/20' :
+          'text-blue-400 hover:text-blue-300 hover:bg-blue-900/30'
+        }`}
+        title={state === 'error' ? 'Decode failed (vgmstream missing?)' : state === 'ready' ? 'Hide player' : 'Preview audio'}
+      >
+        {state === 'loading' ? '\u23F3' : state === 'ready' ? '\u23F9' : state === 'error' ? '\u26A0' : '\u25B6'}
+      </button>
+      {state === 'ready' && audioUrl && (
+        <audio controls autoPlay className="h-7" style={{ maxWidth: '220px' }} src={audioUrl} />
+      )}
+    </span>
+  )
+}
+
 function WwiseBankPreview({ data, assetName }: { data: Uint8Array; assetName: string }) {
-  // Parse BKHD section header from local data for display
+  // Parse BKHD section header from local data for quick display
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
   let bankVersion = 0
   let bankId = 0
@@ -599,20 +704,34 @@ function WwiseBankPreview({ data, assetName }: { data: Uint8Array; assetName: st
     }
   }
 
-  // Fetch full embedded file list via IPC (parses the full untruncated bank)
-  const [embeddedFiles, setEmbeddedFiles] = useState<{ id: number; size: number }[] | null>(null)
+  // Fetch full parsed bank info via IPC (includes HIRC + STID + file labels)
+  const [bankInfo, setBankInfo] = useState<WwiseBankParsed | null>(null)
   const [extracting, setExtracting] = useState(false)
   const [extractStatus, setExtractStatus] = useState<string | null>(null)
+  const [showInfo, setShowInfo] = useState(false)
+  const [showRawData, setShowRawData] = useState(false)
 
   useEffect(() => {
     let cancelled = false
     window.electronAPI.parseWwiseBank(assetName).then(info => {
       if (!cancelled && info) {
-        setEmbeddedFiles(info.embeddedFiles)
+        setBankInfo(info)
       }
     })
     return () => { cancelled = true }
   }, [assetName])
+
+  // Build lookup: fileId → labels
+  const fileLabelMap = useMemo(() => {
+    if (!bankInfo?.fileLabels) return new Map<number, string[]>()
+    const map = new Map<number, string[]>()
+    for (const fl of bankInfo.fileLabels) {
+      map.set(fl.fileId, fl.labels)
+    }
+    return map
+  }, [bankInfo?.fileLabels])
+
+  const embeddedFiles = bankInfo?.embeddedFiles ?? null
 
   const handleExtractAll = useCallback(async () => {
     const dir = await window.electronAPI.selectDirectory()
@@ -633,7 +752,7 @@ function WwiseBankPreview({ data, assetName }: { data: Uint8Array; assetName: st
     if (!dir) return
     setExtracting(true)
     try {
-      const result = await window.electronAPI.extractWwiseAudio(assetName, fileId)
+      const result = await window.electronAPI.extractWwiseAudio(assetName, fileId, dir)
       if (result) {
         setExtractStatus(`Extracted ${fileId}.wem (${formatSize(result.data.length)})`)
       }
@@ -643,38 +762,12 @@ function WwiseBankPreview({ data, assetName }: { data: Uint8Array; assetName: st
     setExtracting(false)
   }, [assetName])
 
+  // Bank name from STID
+  const bankName = bankInfo?.stid?.find(s => s.id === bankId)?.name ?? null
+
   return (
-    <div className="p-4 space-y-3">
-      <div className="text-sm">
-        <span className="text-gray-400">Wwise SoundBank</span>
-        <span className="text-gray-600 mx-2">|</span>
-        <span className="text-gray-400">Version: {bankVersion}</span>
-        <span className="text-gray-600 mx-2">|</span>
-        <span className="text-gray-400">Bank ID: 0x{bankId.toString(16).toUpperCase()}</span>
-      </div>
-
-      {sections.length > 0 && (
-        <table className="text-xs font-mono w-full max-w-md">
-          <thead>
-            <tr className="text-gray-500 border-b border-gray-700">
-              <th className="text-left py-1 pr-4">Section</th>
-              <th className="text-right py-1 pr-4">Offset</th>
-              <th className="text-right py-1">Size</th>
-            </tr>
-          </thead>
-          <tbody>
-            {sections.map((s, i) => (
-              <tr key={i} className="text-gray-300 hover:bg-gray-800/50">
-                <td className="py-0.5 pr-4 text-cyan-400">{s.name}</td>
-                <td className="py-0.5 pr-4 text-right">0x{s.offset.toString(16).toUpperCase()}</td>
-                <td className="py-0.5 text-right">{formatSize(s.size)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-
-      {/* Embedded audio files */}
+    <div className="p-4 space-y-3 overflow-auto flex-1">
+      {/* Embedded audio files — always shown first */}
       {embeddedFiles && embeddedFiles.length > 0 && (
         <div className="space-y-2">
           <div className="flex items-center gap-2">
@@ -687,30 +780,51 @@ function WwiseBankPreview({ data, assetName }: { data: Uint8Array; assetName: st
               {extracting ? 'Extracting...' : 'Extract All .wem'}
             </button>
           </div>
-          <table className="text-xs font-mono w-full max-w-lg">
+          <table className="text-xs font-mono w-full">
             <thead>
               <tr className="text-gray-500 border-b border-gray-700">
-                <th className="text-left py-1 pr-4">File ID</th>
-                <th className="text-right py-1 pr-4">Size</th>
-                <th className="text-right py-1"></th>
+                <th className="text-left py-1 pr-3">File ID</th>
+                <th className="text-left py-1 pr-3">Labels</th>
+                <th className="text-right py-1 pr-3">Size</th>
+                <th className="text-right py-1 pr-1">Actions</th>
               </tr>
             </thead>
             <tbody>
-              {embeddedFiles.map(f => (
-                <tr key={f.id} className="text-gray-300 hover:bg-gray-800/50">
-                  <td className="py-0.5 pr-4 text-amber-400">{f.id}</td>
-                  <td className="py-0.5 pr-4 text-right">{formatSize(f.size)}</td>
-                  <td className="py-0.5 text-right">
-                    <button
-                      onClick={() => handleExtractSingle(f.id)}
-                      disabled={extracting}
-                      className="text-blue-400 hover:text-blue-300 disabled:text-gray-600"
-                    >
-                      Extract
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {embeddedFiles.map(f => {
+                const labels = fileLabelMap.get(f.id)
+                return (
+                  <tr key={f.id} className="text-gray-300 hover:bg-gray-800/50 group">
+                    <td className="py-0.5 pr-3 text-amber-400">{f.id}</td>
+                    <td className="py-0.5 pr-3">
+                      {labels && labels.length > 0 ? (
+                        <span className="flex flex-wrap gap-1">
+                          {labels.map((lbl, i) => (
+                            <span key={i} className={`px-1 py-0 rounded text-[10px] ${
+                              lbl.startsWith('Event:') ? 'bg-purple-900/30 text-purple-300 border border-purple-800/40' :
+                              'bg-gray-700/50 text-gray-400 border border-gray-600/30'
+                            }`}>
+                              {lbl}
+                            </span>
+                          ))}
+                        </span>
+                      ) : (
+                        <span className="text-gray-600">-</span>
+                      )}
+                    </td>
+                    <td className="py-0.5 pr-3 text-right text-gray-400">{formatSize(f.size)}</td>
+                    <td className="py-0.5 pr-1 text-right whitespace-nowrap">
+                      <WemPlayer assetName={assetName} fileId={f.id} />
+                      <button
+                        onClick={() => handleExtractSingle(f.id)}
+                        disabled={extracting}
+                        className="text-blue-400 hover:text-blue-300 disabled:text-gray-600 ml-1 text-xs"
+                      >
+                        Extract
+                      </button>
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
           {extractStatus && (
@@ -720,6 +834,150 @@ function WwiseBankPreview({ data, assetName }: { data: Uint8Array; assetName: st
       )}
       {embeddedFiles && embeddedFiles.length === 0 && (
         <p className="text-xs text-gray-500">No embedded audio files (event-only bank)</p>
+      )}
+
+      {/* Media-only bank indicator */}
+      {bankInfo && !bankInfo.hirc && sections.some(s => s.name === 'DIDX') && (
+        <div className="text-xs text-gray-500 bg-gray-800/50 rounded px-2 py-1 border border-gray-700/50">
+          Media-only bank (no HIRC hierarchy). Audio files are referenced by events in other banks.
+        </div>
+      )}
+
+      {/* Info + Raw Data toggle buttons */}
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => setShowInfo(!showInfo)}
+          className="px-2 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-xs text-gray-300 transition-colors"
+        >
+          {showInfo ? 'Hide Info' : 'Info'}
+        </button>
+        <button
+          onClick={() => setShowRawData(!showRawData)}
+          className="px-2 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-xs text-gray-300 transition-colors"
+        >
+          {showRawData ? 'Hide Raw Data' : 'Raw Data'}
+        </button>
+      </div>
+
+      {/* Collapsible Info section */}
+      {showInfo && (
+        <div className="space-y-3 border border-gray-700 rounded p-3 bg-gray-800/30">
+          {/* Header line */}
+          <div className="text-sm flex items-center gap-2 flex-wrap">
+            <span className="text-gray-400">Version: {bankVersion}</span>
+            <span className="text-gray-600">|</span>
+            <span className="text-gray-400">Bank ID: 0x{bankId.toString(16).toUpperCase()}</span>
+            {bankName && (
+              <>
+                <span className="text-gray-600">|</span>
+                <span className="px-1.5 py-0.5 bg-cyan-900/40 border border-cyan-800/50 rounded text-xs font-mono text-cyan-300">
+                  {bankName}
+                </span>
+              </>
+            )}
+          </div>
+
+          {/* Section table */}
+          {sections.length > 0 && (
+            <table className="text-xs font-mono w-full max-w-md">
+              <thead>
+                <tr className="text-gray-500 border-b border-gray-700">
+                  <th className="text-left py-1 pr-4">Section</th>
+                  <th className="text-right py-1 pr-4">Offset</th>
+                  <th className="text-right py-1">Size</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sections.map((s, i) => (
+                  <tr key={i} className="text-gray-300 hover:bg-gray-800/50">
+                    <td className="py-0.5 pr-4 text-cyan-400">{s.name}</td>
+                    <td className="py-0.5 pr-4 text-right">0x{s.offset.toString(16).toUpperCase()}</td>
+                    <td className="py-0.5 text-right">{formatSize(s.size)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          {/* HIRC summary */}
+          {bankInfo?.hirc && (
+            <div className="space-y-1">
+              <div className="text-xs text-gray-400 flex items-center gap-1">
+                <span>Hierarchy: {bankInfo.hirc.totalCount} objects</span>
+                <span className="text-gray-600 ml-1">
+                  ({bankInfo.hirc.events.length} events, {bankInfo.hirc.actions.length} actions, {bankInfo.hirc.sounds.length} sounds)
+                </span>
+              </div>
+              <div className="ml-3 space-y-2">
+                {/* Events */}
+                {bankInfo.hirc.events.length > 0 && (
+                  <div>
+                    <div className="text-xs text-purple-400 mb-0.5">Events ({bankInfo.hirc.events.length})</div>
+                    <div className="flex flex-wrap gap-1">
+                      {bankInfo.hirc.events.slice(0, 20).map(evt => (
+                        <span key={evt.id} className="px-1.5 py-0.5 bg-purple-900/30 border border-purple-800/40 rounded text-[10px] font-mono text-purple-300">
+                          0x{evt.id.toString(16).toUpperCase()} ({evt.actionIds.length} action{evt.actionIds.length !== 1 ? 's' : ''})
+                        </span>
+                      ))}
+                      {bankInfo.hirc.events.length > 20 && (
+                        <span className="text-[10px] text-gray-500">+{bankInfo.hirc.events.length - 20} more</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {/* Actions */}
+                {bankInfo.hirc.actions.length > 0 && (
+                  <div>
+                    <div className="text-xs text-green-400 mb-0.5">Actions ({bankInfo.hirc.actions.length})</div>
+                    <div className="flex flex-wrap gap-1">
+                      {bankInfo.hirc.actions.slice(0, 20).map(act => (
+                        <span key={act.id} className="px-1.5 py-0.5 bg-green-900/30 border border-green-800/40 rounded text-[10px] font-mono text-green-300">
+                          {act.actionTypeName}
+                        </span>
+                      ))}
+                      {bankInfo.hirc.actions.length > 20 && (
+                        <span className="text-[10px] text-gray-500">+{bankInfo.hirc.actions.length - 20} more</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {/* Sounds */}
+                {bankInfo.hirc.sounds.length > 0 && (
+                  <div>
+                    <div className="text-xs text-amber-400 mb-0.5">Sounds ({bankInfo.hirc.sounds.length})</div>
+                    <div className="flex flex-wrap gap-1 text-[10px] text-gray-400">
+                      {(() => {
+                        const embedded = bankInfo.hirc.sounds.filter(s => s.streamType === 0).length
+                        const prefetch = bankInfo.hirc.sounds.filter(s => s.streamType === 1).length
+                        const streamed = bankInfo.hirc.sounds.filter(s => s.streamType === 2).length
+                        return (
+                          <>
+                            {embedded > 0 && <span>{embedded} embedded</span>}
+                            {prefetch > 0 && <span>{prefetch} prefetch</span>}
+                            {streamed > 0 && <span>{streamed} streamed</span>}
+                          </>
+                        )
+                      })()}
+                    </div>
+                  </div>
+                )}
+                {/* Other types */}
+                {bankInfo.hirc.otherTypeCounts.length > 0 && (
+                  <div className="text-[10px] text-gray-500">
+                    Other: {bankInfo.hirc.otherTypeCounts.map(t => `${t.typeName}(${t.count})`).join(', ')}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Collapsible Raw Data section */}
+      {showRawData && (
+        <div className="overflow-auto max-h-[400px]">
+          <HexDump data={data} maxRows={32} />
+        </div>
       )}
     </div>
   )
@@ -733,10 +991,13 @@ function BlobPreview({ data, assetData, selectedAsset }: {
 }) {
   const [extracting, setExtracting] = useState(false)
   const [extractStatus, setExtractStatus] = useState<string | null>(null)
+  const [showRawData, setShowRawData] = useState(false)
   const blobType = assetData.blobType
   const typeName = BLOB_TYPE_NAMES[blobType] || `Unknown (${blobType})`
   const ext = BLOB_TYPE_EXT[blobType] || '.bin'
   const details = useMemo(() => parseBlobDetails(data, blobType), [data, blobType])
+  const hasVisualPreview = isBlobPreviewable(blobType, data)
+  const [showInfo, setShowInfo] = useState(!hasVisualPreview)
 
   const handleExtractAllOfType = useCallback(async () => {
     const dir = await window.electronAPI.selectDirectory()
@@ -752,8 +1013,10 @@ function BlobPreview({ data, assetData, selectedAsset }: {
     setExtracting(false)
   }, [blobType, typeName, ext])
 
+  const needsFlex = blobType === 5 || blobType === 12 // animation / skeleton viewers need flex fill
+
   return (
-    <div className="p-4 space-y-3">
+    <div className={`p-4 space-y-3 ${needsFlex ? 'flex flex-col h-full' : ''}`}>
       {selectedAsset.type === 'blob' && blobType >= 0 && (
         <div className="space-y-2">
           <div className="flex items-center gap-2 text-sm">
@@ -763,33 +1026,45 @@ function BlobPreview({ data, assetData, selectedAsset }: {
             <span className="text-gray-400">{formatSize(assetData.totalSize)}</span>
             <span className="text-gray-600">|</span>
             <span className="text-gray-500 font-mono text-xs">{ext}</span>
+            {hasVisualPreview && details && (
+              <button
+                onClick={() => setShowInfo(!showInfo)}
+                className="ml-auto px-2 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-xs text-gray-300 transition-colors"
+              >
+                {showInfo ? 'Hide Info' : 'Info'}
+              </button>
+            )}
           </div>
 
-          {/* Format-specific details */}
-          {details && (
-            <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs max-w-sm pl-1">
-              {Object.entries(details).map(([key, value]) => (
-                <React.Fragment key={key}>
-                  <span className="text-gray-500">{key}</span>
-                  <span className="text-gray-300 font-mono">{value}</span>
-                </React.Fragment>
-              ))}
+          {/* Format-specific details (collapsed by default for previewable types) */}
+          {details && showInfo && (
+            <div className="max-h-48 overflow-y-auto">
+              <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs max-w-sm pl-1">
+                {Object.entries(details).map(([key, value]) => (
+                  <React.Fragment key={key}>
+                    <span className="text-gray-500">{key}</span>
+                    <span className="text-gray-300 font-mono">{value}</span>
+                  </React.Fragment>
+                ))}
+              </div>
             </div>
           )}
 
           {/* Batch extract button */}
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleExtractAllOfType}
-              disabled={extracting}
-              className="px-2 py-0.5 bg-blue-700 hover:bg-blue-600 disabled:bg-gray-700 disabled:text-gray-500 rounded text-xs transition-colors"
-            >
-              {extracting ? 'Extracting...' : `Extract All ${typeName}s`}
-            </button>
-            {extractStatus && (
-              <span className="text-xs text-gray-400">{extractStatus}</span>
-            )}
-          </div>
+          {showInfo && (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleExtractAllOfType}
+                disabled={extracting}
+                className="px-2 py-0.5 bg-blue-700 hover:bg-blue-600 disabled:bg-gray-700 disabled:text-gray-500 rounded text-xs transition-colors"
+              >
+                {extracting ? 'Extracting...' : `Extract All ${typeName}s`}
+              </button>
+              {extractStatus && (
+                <span className="text-xs text-gray-400">{extractStatus}</span>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -803,19 +1078,40 @@ function BlobPreview({ data, assetData, selectedAsset }: {
       {blobType === 9 && (
         <BlendMeshPreview data={data} details={details} />
       )}
-      {blobType === 5 && details && <AnimationSummary data={data} details={details} />}
+      {blobType === 5 && details && showInfo && <AnimationSummary data={data} details={details} />}
+      {blobType === 5 && <AnimationSkeletonViewer animationName={selectedAsset.name} />}
+      {blobType === 12 && <SkeletonViewer assetName={selectedAsset.name} />}
 
-      {/* Only show hex dump for non-previewable types that have data */}
-      {!isBlobPreviewable(blobType, data) && (
-        <>
-          <HexDump data={data} maxRows={32} />
-          {assetData.truncated && (
-            <p className="text-xs text-gray-500">
-              Showing first {formatSize(data.length)} of {formatSize(assetData.totalSize)}. Extract to view full file.
-            </p>
+      {/* Description for types without visual preview */}
+      {!hasVisualPreview && (
+        <div className="text-xs space-y-1 px-1">
+          {BLOB_TYPE_DESC[blobType] && (
+            <p className="text-gray-500">{BLOB_TYPE_DESC[blobType]}</p>
           )}
-        </>
+          <p className="text-gray-600">No visual preview available for this format. Use Raw Data or Extract to inspect.</p>
+          <p className="text-gray-700 italic">Format identification is experimental and may be inaccurate.</p>
+        </div>
       )}
+
+      {/* Raw hex dump toggle */}
+      <div>
+        <button
+          onClick={() => setShowRawData(!showRawData)}
+          className="px-2 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-xs text-gray-300 transition-colors"
+        >
+          {showRawData ? 'Hide Raw Data' : 'Raw Data'}
+        </button>
+        {showRawData && (
+          <div className="mt-2 overflow-auto max-h-[400px]">
+            <HexDump data={data} maxRows={32} />
+            {assetData.truncated && (
+              <p className="text-xs text-gray-500">
+                Showing first {formatSize(data.length)} of {formatSize(assetData.totalSize)}. Extract to view full file.
+              </p>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -888,6 +1184,26 @@ function AnimationSummary({ data, details }: { data: Uint8Array; details: Record
       )}
     </div>
   )
+}
+
+// --- Animation skeleton finder (finds skeleton in BLP, renders SkeletonViewer with auto-play) ---
+function AnimationSkeletonViewer({ animationName }: { animationName: string }) {
+  const [skeletonName, setSkeletonName] = useState<string | null>(null)
+  const [searched, setSearched] = useState(false)
+
+  useEffect(() => {
+    setSkeletonName(null)
+    setSearched(false)
+    window.electronAPI.listSkeletons().then(skels => {
+      setSearched(true)
+      if (skels.length > 0) setSkeletonName(skels[0].name)
+    }).catch(() => setSearched(true))
+  }, [animationName])
+
+  if (!searched) return <div className="text-xs text-gray-500">Finding skeleton...</div>
+  if (!skeletonName) return <div className="text-xs text-gray-600">No skeleton found in this BLP</div>
+
+  return <SkeletonViewer assetName={skeletonName} initialAnimation={animationName} />
 }
 
 // --- Heightmap preview (renders hmu0 uint16 or raw float32 grid as grayscale image) ---
@@ -1230,6 +1546,8 @@ function isBlobPreviewable(blobType: number, data: Uint8Array): boolean {
   if (blobType === 5) return true
   // WAV audio handled upstream
   if (blobType === 7) return true
+  // Skeleton - 3D viewer
+  if (blobType === 12) return true
   return false
 }
 
@@ -1666,8 +1984,10 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
   return (
     <div className="flex-1 flex flex-col">
       {/* Toolbar */}
-      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-gray-700 text-sm">
-        <span className="text-gray-400">{typeLabel}</span>
+      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-gray-700 text-sm min-w-0">
+        <span className="text-gray-300 truncate font-mono text-xs" title={selectedAsset.name}>{selectedAsset.name}</span>
+        <span className="text-gray-600">|</span>
+        <span className="text-gray-400 shrink-0">{typeLabel}</span>
         {assetData && (
           <>
             <span className="text-gray-600">|</span>
@@ -1689,24 +2009,44 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
       <div className="flex-1 overflow-auto">
         {!data ? (
           <div className="flex items-center justify-center h-full text-gray-500">
-            <div className="text-center">
+            <div className="text-center max-w-sm">
               <div className="text-3xl mb-2">
                 {selectedAsset.type === 'sound' ? '\u{1F50A}' : selectedAsset.type === 'gpu' ? '\u{1F4BE}' : '\u{1F4E6}'}
               </div>
               <p className="font-mono text-sm">{selectedAsset.name}</p>
-              <p className="text-xs mt-1">Asset data not found in SHARED_DATA</p>
+              <p className="text-xs mt-2 text-gray-400">
+                {(() => {
+                  const blobType = selectedAsset.metadata?.blobType as number | undefined
+                  const blobName = typeof blobType === 'number' ? BLOB_TYPE_NAMES[blobType] : null
+                  const desc = typeof blobType === 'number'
+                    ? BLOB_TYPE_DESC[blobType]
+                    : ASSET_TYPE_DESC[selectedAsset.type]
+                  return blobName
+                    ? `This appears to be a ${blobName} asset.`
+                    : `Asset type: ${typeLabel}.`
+                })()}
+              </p>
+              {(() => {
+                const blobType = selectedAsset.metadata?.blobType as number | undefined
+                const desc = typeof blobType === 'number'
+                  ? BLOB_TYPE_DESC[blobType]
+                  : ASSET_TYPE_DESC[selectedAsset.type]
+                return desc ? (
+                  <p className="text-xs mt-1 text-gray-600">{desc}</p>
+                ) : null
+              })()}
+              <p className="text-xs mt-2 text-gray-600">
+                No preview available — asset data not found in SHARED_DATA.
+              </p>
+              <p className="text-xs mt-1 text-gray-700 italic">
+                Format identification is experimental and may be inaccurate.
+              </p>
             </div>
           </div>
         ) : isWav && !assetData?.truncated ? (
           <AudioPreview data={data} name={selectedAsset.name} />
         ) : isWwiseBank ? (
-          <div className="flex flex-col h-full">
-            <WwiseBankPreview data={data} assetName={selectedAsset.name} />
-            <div className="border-t border-gray-700 p-3 flex-1 overflow-auto">
-              <p className="text-xs text-gray-500 mb-2">Raw data:</p>
-              <HexDump data={data} maxRows={24} />
-            </div>
-          </div>
+          <WwiseBankPreview data={data} assetName={selectedAsset.name} />
         ) : selectedAsset.type === 'gpu' ? (
           <div className="p-4 space-y-3">
             <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm max-w-sm">
