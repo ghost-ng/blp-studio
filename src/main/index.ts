@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, Menu, nativeImage, clipboard, protocol } from 'electron'
-import { join } from 'path'
+import { join, dirname } from 'path'
 import { tmpdir } from 'os'
 import { BLPParser } from '../core/blp-parser'
 import { readCivbig, readCivbigInfo, writeCivbig } from '../core/civbig'
@@ -14,8 +14,9 @@ import {
 } from '../core/game-detect'
 import { decodeBCn } from '../core/bcn-decoder'
 import { generateModinfo, generateDep, sanitizeModId } from '../core/mod-manifest'
-import { parseWwiseBank, extractWemFile, setWwiseBankLogger, getActionTypeName, getHircTypeName } from '../core/wwise-bank'
+import { parseWwiseBank, extractWemFile, setWwiseBankLogger, getActionTypeName, getHircTypeName, fnv1aHash32 } from '../core/wwise-bank'
 import { parseSkeleton, parseAnimation } from '../core/skel-parser'
+import { extractGeometryComponents, parseMeshLodData } from '../core/mesh-parser'
 import { initPreferences, loadPreferences, setTheme, updatePreferences, addRecentFile, clearRecentFiles } from '../core/preferences'
 import { initLogger, log, warn, error as logError, getLogPath } from '../core/logger'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, unlinkSync } from 'fs'
@@ -170,6 +171,7 @@ function createDDSWindow(filepath: string) {
   }
 }
 
+// ---- Model Viewer Window ----
 // ---- Application Menu ----
 function buildMenu() {
   const prefs = loadPreferences()
@@ -2347,6 +2349,281 @@ function setupIPC() {
       results.push({ name: obj.m_Name as string, size: (obj.m_nSize as number) || 0 })
     }
     return results
+  })
+
+  // ---- Model Viewer ----
+
+  ipcMain.handle('model:parse', async (_e, blpPath: string) => {
+    if (!isString(blpPath)) return null
+    log(`[model] parsing geometry from: ${blpPath}`)
+
+    // Use the parser cache or parse fresh
+    let parser = parserCache.get(blpPath)
+    if (!parser) {
+      try {
+        parser = new BLPParser(blpPath)
+        parser.parse()
+        parserCache.set(blpPath, parser)
+      } catch (e) {
+        logError(`[model] failed to parse BLP: ${blpPath}`, e)
+        return null
+      }
+    }
+
+    try {
+      const components = extractGeometryComponents(parser)
+      if (components.length === 0) {
+        warn(`[model] no geometry components found in ${blpPath}`)
+        return null
+      }
+
+      // For now, parse the first geometry component, LOD 0
+      // Find the first LOD 0 geometry entry
+      const comp = components[0]
+      const lod0Geoms = comp.geometries.filter(g => g.lod === 0)
+      if (lod0Geoms.length === 0 || comp.lods.length === 0) {
+        warn(`[model] no LOD 0 geometry found`)
+        return null
+      }
+
+      // Build GPU buffer size + material name maps upfront (avoids repeated iteration)
+      const gpuSizeMap = new Map<string, number>()
+      const gpuMaterialNameMap = new Map<string, string>()
+      for (const alloc of parser.iterEntriesByType('BLP::GpuBufferEntry')) {
+        const obj = parser.deserializeAlloc(alloc)
+        const name = obj.m_Name as string
+        const size = (obj.m_nSize as number) || 0
+        if (name && size) gpuSizeMap.set(name, size)
+        const matName = obj.m_MaterialName as string
+        if (name && matName) gpuMaterialNameMap.set(name, matName)
+      }
+
+      // Cache loaded+decompressed buffers (multiple meshes often share one buffer)
+      const bufferCache = new Map<string, Buffer>()
+
+      // Collect all LOD 0 mesh lods
+      const meshDataList: {
+        positions: number[]
+        indices: number[]
+        normals: number[] | null
+        vertexCount: number
+        triangleCount: number
+        materialHash: number
+        materialName: string
+        skeletonIndex: number
+      }[] = []
+
+      for (const geom of lod0Geoms) {
+        for (let mi = geom.meshStart; mi < geom.meshStart + geom.meshCount && mi < comp.meshes.length; mi++) {
+          const mesh = comp.meshes[mi]
+          // Take only the first LOD pair for each mesh (LOD 0)
+          const lodIdx = mesh.lodStart
+          if (lodIdx >= comp.lods.length) continue
+          const meshLod = comp.lods[lodIdx]
+
+          if (!meshLod.vbName) continue
+
+          // Load the GPU buffer data (with caching)
+          let bufferData = bufferCache.get(meshLod.vbName)
+          if (!bufferData) {
+            const civbigPath = sdIndex.get(meshLod.vbName)
+            if (!civbigPath) {
+              warn(`[model] GPU buffer not found in SHARED_DATA: ${meshLod.vbName}`)
+              continue
+            }
+
+            const { data } = readCivbig(civbigPath)
+            bufferData = data
+
+            if (OodleDecompressor.isOodleCompressed(data) && oodle) {
+              const storedSize = gpuSizeMap.get(meshLod.vbName) || data.length * 4
+              const raw = oodle.decompress(data, storedSize)
+              if (raw) bufferData = raw
+            }
+            bufferCache.set(meshLod.vbName, bufferData)
+          }
+
+          const parsed = parseMeshLodData(bufferData, meshLod)
+
+          meshDataList.push({
+            positions: Array.from(parsed.positions),
+            indices: Array.from(parsed.indices),
+            normals: parsed.normals ? Array.from(parsed.normals) : null,
+            uvs: parsed.uvs ? Array.from(parsed.uvs) : null,
+            boneIndices: parsed.boneIndices ? Array.from(parsed.boneIndices) : null,
+            boneWeights: parsed.boneWeights ? Array.from(parsed.boneWeights) : null,
+            vertexCount: parsed.vertexCount,
+            triangleCount: parsed.triangleCount,
+            materialHash: meshLod.materialHash,
+            materialName: meshLod.materialName
+              || gpuMaterialNameMap.get(meshLod.vbName)
+              || (meshLod.vbName.match(/^GB_(.+)_MB$/) || [])[1]
+              || '',
+            skeletonIndex: mesh.skeletonIndex !== 65535 ? mesh.skeletonIndex : 0,
+          })
+        }
+      }
+
+      // Find matching skeleton blob by bone count (296 bytes per bone, no header)
+      // Use max transformIndex to determine minimum bone count needed
+      let skeletonBlobName: string | null = null
+      {
+        const maxTransformIdx = comp.deformers.reduce((max, d) => Math.max(max, d.transformIndex), 0)
+        const targetBones = maxTransformIdx + 1
+        const skelBlobs: { name: string; boneCount: number }[] = []
+        for (const alloc of parser.iterEntriesByType('BLP::BlobEntry')) {
+          const obj = parser.deserializeAlloc(alloc)
+          const bt = (obj.m_nBlobType as number) ?? -1
+          if (bt !== 12) continue
+          const name = obj.m_Name as string
+          const size = (obj.m_nSize as number) || 0
+          if (name && size) skelBlobs.push({ name, boneCount: Math.floor(size / 296) })
+        }
+        if (skelBlobs.length === 1) {
+          skeletonBlobName = skelBlobs[0].name
+        } else if (skelBlobs.length > 1) {
+          // Pick smallest skeleton with enough bones (>= targetBones)
+          skelBlobs.sort((a, b) => {
+            const da = a.boneCount - targetBones
+            const db = b.boneCount - targetBones
+            if (da >= 0 && db < 0) return -1
+            if (da < 0 && db >= 0) return 1
+            return Math.abs(da) - Math.abs(db)
+          })
+          skeletonBlobName = skelBlobs[0].name
+        }
+        log(`[model] skeleton: ${skeletonBlobName || 'none'} (need ${targetBones} bones [maxTransform=${maxTransformIdx}], found ${skelBlobs.map(s => `${s.name}(${s.boneCount})`).join(', ') || 'none'})`)
+      }
+
+      log(`[model] meshSkeletons: ${comp.skeletons.length} entries, ${comp.deformers.length} deformers, transformIndex range [${Math.min(...comp.deformers.map(d => d.transformIndex))}-${Math.max(...comp.deformers.map(d => d.transformIndex))}]`)
+
+      // Resolve materialHash → materialName via Material.blp texture naming convention
+      const matBlpPath = join(dirname(blpPath), 'Material.blp')
+      if (existsSync(matBlpPath)) {
+        let matParser = parserCache.get(matBlpPath)
+        if (!matParser) {
+          matParser = new BLPParser(matBlpPath)
+          matParser.parse()
+          parserCache.set(matBlpPath, matParser)
+        }
+
+        // Extract unique material names from TEXTURE_{matName}_{B|N|O|E} patterns
+        const matNamesByHash = new Map<number, string>()
+        for (const alloc of matParser.iterEntriesByType('BLP::TextureEntry')) {
+          const obj = matParser.deserializeAlloc(alloc)
+          const texName = obj.m_Name as string
+          if (!texName) continue
+          const match = texName.match(/^TEXTURE_(.+)_[BNOEM]$/)
+          if (match) {
+            const matName = match[1]
+            const hash = fnv1aHash32(matName)
+            if (!matNamesByHash.has(hash)) matNamesByHash.set(hash, matName)
+          }
+        }
+
+        // Assign correct materialName to each mesh by matching hash
+        let resolved = 0
+        for (const meshData of meshDataList) {
+          const name = matNamesByHash.get(meshData.materialHash)
+          if (name) {
+            meshData.materialName = name
+            resolved++
+          }
+        }
+
+        const meshHashes = [...new Set(meshDataList.map(m => `0x${(m.materialHash >>> 0).toString(16)}`))].join(', ')
+        log(`[model] materialHash: resolved ${resolved}/${meshDataList.length} meshes, ${matNamesByHash.size} materials from Material.blp, mesh hashes [${meshHashes}]`)
+        if (resolved === 0 && matNamesByHash.size > 0) {
+          // Log first few to help debug hash function mismatch
+          const samples = [...matNamesByHash.entries()].slice(0, 3).map(([h, n]) => `${n}→0x${(h >>> 0).toString(16)}`).join(', ')
+          warn(`[model] hash mismatch! material hashes: [${samples}]`)
+        }
+      }
+
+      const materialNames = [...new Set(meshDataList.map(m => m.materialName).filter(Boolean))]
+      log(`[model] parsed ${meshDataList.length} meshes, ${materialNames.length} materials [${materialNames.slice(0, 5).join(', ')}${materialNames.length > 5 ? '...' : ''}] from ${blpPath}`)
+
+      return {
+        meshes: meshDataList,
+        componentCount: components.length,
+        skeletons: comp.skeletons,
+        deformers: comp.deformers,
+        skeletonBlobName,
+      }
+    } catch (e) {
+      logError(`[model] error parsing geometry`, e)
+      return null
+    }
+  })
+
+  // Load texture mappings from Material.blp alongside a StandardAsset.blp
+  ipcMain.handle('model:load-textures', async (_e, blpPath: string, materialNames: string[]) => {
+    if (!isString(blpPath) || !Array.isArray(materialNames)) return null
+
+    try {
+      const blpDir = dirname(blpPath)
+      const materialBlpPath = join(blpDir, 'Material.blp')
+
+      if (!existsSync(materialBlpPath)) {
+        warn(`[model] Material.blp not found at: ${materialBlpPath}`)
+        return null
+      }
+
+      // Parse Material.blp (use parser cache)
+      let matParser = parserCache.get(materialBlpPath)
+      if (!matParser) {
+        matParser = new BLPParser(materialBlpPath)
+        matParser.parse()
+        parserCache.set(materialBlpPath, matParser)
+      }
+
+      // Extract texture entries and merge into textureIndex for blp-preview:// protocol
+      const matTextures = new Map<string, TextureInfo>()
+      for (const alloc of matParser.iterEntriesByType('BLP::TextureEntry')) {
+        const obj = matParser.deserializeAlloc(alloc)
+        const name = obj.m_Name as string
+        if (!name) continue
+        const info: TextureInfo = {
+          width: (obj.m_nWidth as number) || 0,
+          height: (obj.m_nHeight as number) || 0,
+          mips: (obj.m_nMips as number) || 1,
+          format: (obj.m_eFormat as number) || 0,
+        }
+        matTextures.set(name, info)
+        // Merge into global textureIndex so blp-preview:// protocol can serve them
+        if (!textureIndex.has(name)) {
+          textureIndex.set(name, info)
+        }
+      }
+
+      log(`[model] Material.blp: ${matTextures.size} textures indexed`)
+
+      // Build material map: for each material name, find matching textures by naming convention
+      const materialMap: Record<string, { diffuse?: string; normal?: string; orm?: string }> = {}
+
+      for (const matName of materialNames) {
+        if (!matName) continue
+        const entry: { diffuse?: string; normal?: string; orm?: string } = {}
+
+        const diffuseName = `TEXTURE_${matName}_B`
+        const normalName = `TEXTURE_${matName}_N`
+        const ormName = `TEXTURE_${matName}_O`
+
+        if (matTextures.has(diffuseName)) entry.diffuse = diffuseName
+        if (matTextures.has(normalName)) entry.normal = normalName
+        if (matTextures.has(ormName)) entry.orm = ormName
+
+        if (entry.diffuse || entry.normal || entry.orm) {
+          materialMap[matName] = entry
+        }
+      }
+
+      log(`[model] resolved textures for ${Object.keys(materialMap).length}/${materialNames.length} materials`)
+      return materialMap
+    } catch (e) {
+      logError(`[model] error loading material textures`, e)
+      return null
+    }
   })
 }
 

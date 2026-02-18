@@ -157,6 +157,19 @@ export function fnv1Hash32(input: string): number {
   return hash >>> 0
 }
 
+/**
+ * FNV-1a 32-bit hash (xor-then-multiply variant).
+ * Used by Civ7 for material name hashing (case-sensitive).
+ */
+export function fnv1aHash32(input: string): number {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return hash >>> 0
+}
+
 // ---- Internal logging ----
 
 type LogFn = (msg: string) => void

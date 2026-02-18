@@ -119,6 +119,18 @@ declare global {
       logTiming: (msg: string) => Promise<void>
       onPreloadProgress: (callback: (info: { current: number; total: number }) => void) => () => void
       onDdsLoadFile: (callback: (filepath: string) => void) => () => void
+      parseModel: (blpPath: string) => Promise<{
+        meshes: { positions: number[]; indices: number[]; normals: number[] | null; uvs: number[] | null; boneIndices: number[] | null; boneWeights: number[] | null; vertexCount: number; triangleCount: number; materialHash: number; materialName: string }[]
+        componentCount: number
+        skeletons: { hash: number; deformerStart: number; deformerCount: number }[]
+        deformers: { nameHash: number; transformIndex: number; parent: number; inverseBind: { position: number[]; scale: number; rotation: number[] } }[]
+        skeletonBlobName: string | null
+      } | null>
+      loadModelTextures: (blpPath: string, materialNames: string[]) => Promise<Record<string, { diffuse?: string; normal?: string; orm?: string }> | null>
+      parseSkeleton: (name: string) => Promise<{ boneCount: number; bones: { index: number; name: string; parentIndex: number; localPosition: number[]; localRotation: number[]; worldPosition: number[]; worldRotation: number[] }[] } | null>
+      parseAnimation: (name: string) => Promise<{ fps: number; frameCount: number; boneCount: number; duration: number; name: string; isV0: boolean; isWorldSpace: boolean; keyframes: { rotation: number[]; position: number[]; scale: number[] }[][] | null } | null>
+      listAnimations: (boneCount: number) => Promise<{ name: string; size: number }[]>
+      listSkeletons: () => Promise<{ name: string; size: number }[]>
     }
   }
 }
@@ -165,6 +177,15 @@ export default function App() {
   const [ddsViewMode, setDdsViewMode] = useState<DdsViewMode>('viewer')
   const [showBatchDialog, setShowBatchDialog] = useState(false)
   const [isDdsOnlyWindow, setIsDdsOnlyWindow] = useState(false)
+  const [modelViewerActive, setModelViewerActive] = useState(false)
+  const [modelData, setModelData] = useState<{
+    meshes: { positions: number[]; indices: number[]; normals: number[] | null; uvs: number[] | null; boneIndices: number[] | null; boneWeights: number[] | null; vertexCount: number; triangleCount: number; materialHash: number; materialName: string }[]
+    componentCount: number
+    skeletons: { hash: number; deformerStart: number; deformerCount: number }[]
+    deformers: { nameHash: number; transformIndex: number; parent: number; inverseBind: { position: number[]; scale: number; rotation: number[] } }[]
+    skeletonBlobName: string | null
+  } | null>(null)
+  const [materialMap, setMaterialMap] = useState<Record<string, { diffuse?: string; normal?: string; orm?: string }> | null>(null)
   const [showAbout, setShowAbout] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [textPreview, setTextPreview] = useState<{ title: string; text: string; language: 'json' | 'xml'; defaultFilename: string; filterName: string; filterExt: string } | null>(null)
@@ -241,6 +262,7 @@ export default function App() {
     })
     return cleanup
   }, [notify])
+
 
   const toggleTheme = useCallback(() => {
     setThemeState(prev => {
@@ -549,6 +571,35 @@ export default function App() {
       notify('error', 'Failed to open DDS', String(e))
     }
   }, [notify])
+
+  // Open inline model viewer in preview panel
+  const handleOpenModelViewer = useCallback(async () => {
+    if (!manifest?.filepath) return
+    setModelViewerActive(true)
+    setModelData(null)
+    setMaterialMap(null)
+    try {
+      const result = await window.electronAPI.parseModel(manifest.filepath)
+      if (result) {
+        setModelData(result)
+        // Async texture loading from Material.blp
+        const materialNames = [...new Set(result.meshes.map(m => m.materialName).filter(Boolean))]
+        if (materialNames.length > 0) {
+          const texMap = await window.electronAPI.loadModelTextures(manifest.filepath, materialNames)
+          if (texMap) setMaterialMap(texMap)
+        }
+      }
+    } catch (e) {
+      console.error('Failed to parse model:', e)
+      notify('error', 'Failed to parse model', String(e))
+    }
+  }, [manifest, notify])
+
+  const handleCloseModelViewer = useCallback(() => {
+    setModelViewerActive(false)
+    setModelData(null)
+    setMaterialMap(null)
+  }, [])
 
   // Context menu: open texture in DDS viewer window
   const handleOpenInDdsViewer = useCallback(async (name: string) => {
@@ -1026,6 +1077,11 @@ export default function App() {
               onCopyImage={handleCopyPreviewAsPng}
               experimentalEnabled={settingsData.experimentalFeatures}
               onPainted={handlePainted}
+              onOpenModelViewer={handleOpenModelViewer}
+              modelViewerActive={modelViewerActive}
+              modelData={modelData}
+              materialMap={materialMap}
+              onCloseModelViewer={handleCloseModelViewer}
             />
           </div>
 

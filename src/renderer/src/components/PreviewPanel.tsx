@@ -3,6 +3,7 @@ import { flushSync } from 'react-dom'
 import { ColorInspector, pickPixel, PickedColor } from './ColorInspector'
 import { MagnifierLoupe } from './MagnifierLoupe'
 import { SkeletonViewer } from './SkeletonViewer'
+import { ModelViewer } from './ModelViewer'
 
 interface AssetEntry {
   name: string
@@ -30,6 +31,14 @@ interface AssetData {
   typeFlags: number
 }
 
+interface ModelDataType {
+  meshes: { positions: number[]; indices: number[]; normals: number[] | null; uvs: number[] | null; boneIndices: number[] | null; boneWeights: number[] | null; vertexCount: number; triangleCount: number; materialHash: number; materialName: string }[]
+  componentCount: number
+  skeletons: { hash: number; deformerStart: number; deformerCount: number }[]
+  deformers: { nameHash: number; transformIndex: number; parent: number; inverseBind: { position: number[]; scale: number; rotation: number[] } }[]
+  skeletonBlobName: string | null
+}
+
 interface PreviewPanelProps {
   selectedAsset: AssetEntry | null
   preview: TexturePreview | null
@@ -42,6 +51,11 @@ interface PreviewPanelProps {
   onCopyImage?: () => void
   experimentalEnabled?: boolean
   onPainted?: () => void
+  onOpenModelViewer?: () => void
+  modelViewerActive?: boolean
+  modelData?: ModelDataType | null
+  materialMap?: Record<string, { diffuse?: string; normal?: string; orm?: string }> | null
+  onCloseModelViewer?: () => void
 }
 
 interface CanvasContextMenuState {
@@ -984,10 +998,11 @@ function WwiseBankPreview({ data, assetName }: { data: Uint8Array; assetName: st
 }
 
 // --- Blob preview with format analysis and batch extraction ---
-function BlobPreview({ data, assetData, selectedAsset }: {
+function BlobPreview({ data, assetData, selectedAsset, onOpenModelViewer }: {
   data: Uint8Array
   assetData: AssetData
   selectedAsset: AssetEntry
+  onOpenModelViewer?: () => void
 }) {
   const [extracting, setExtracting] = useState(false)
   const [extractStatus, setExtractStatus] = useState<string | null>(null)
@@ -1026,6 +1041,15 @@ function BlobPreview({ data, assetData, selectedAsset }: {
             <span className="text-gray-400">{formatSize(assetData.totalSize)}</span>
             <span className="text-gray-600">|</span>
             <span className="text-gray-500 font-mono text-xs">{ext}</span>
+            {onOpenModelViewer && [5, 11, 12, 13].includes(blobType) && (
+              <button
+                onClick={onOpenModelViewer}
+                className="px-2 py-0.5 bg-indigo-700 hover:bg-indigo-600 rounded text-xs text-gray-100 transition-colors"
+                title="View 3D model with textures and animation"
+              >
+                3D View
+              </button>
+            )}
             {hasVisualPreview && details && (
               <button
                 onClick={() => setShowInfo(!showInfo)}
@@ -1594,7 +1618,7 @@ function ActionButtons({ onExtract, onReplace, onRevert, isReplaced, experimenta
   )
 }
 
-export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExtract, onReplace, onRevert, isReplaced, onCopyImage, experimentalEnabled, onPainted }: PreviewPanelProps) {
+export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExtract, onReplace, onRevert, isReplaced, onCopyImage, experimentalEnabled, onPainted, onOpenModelViewer, modelViewerActive, modelData, materialMap, onCloseModelViewer }: PreviewPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const [zoom, setZoom] = useState(1)
@@ -1775,6 +1799,27 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
   const effectiveGridPx = gridSize * zoom
   const gridOpacity = effectiveGridPx >= 32 ? 0.5 : effectiveGridPx >= 16 ? 0.4 : effectiveGridPx >= 8 ? 0.35 : 0.3
   const showGridOverlay = gridSize > 0 && effectiveGridPx >= 4
+
+  // Inline model viewer — replaces normal preview content when active
+  if (modelViewerActive) {
+    return (
+      <div className="flex-1 flex flex-col">
+        {/* Back button toolbar */}
+        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-gray-700 text-sm shrink-0">
+          <button
+            onClick={onCloseModelViewer}
+            className="px-2 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-xs text-gray-300 transition-colors"
+          >
+            Back
+          </button>
+          <span className="text-gray-500">|</span>
+          <span className="text-gray-300 text-xs">3D Viewer</span>
+        </div>
+        {/* Model viewer fills the rest */}
+        <ModelViewer modelData={modelData || null} materialMap={materialMap || null} />
+      </div>
+    )
+  }
 
   if (!selectedAsset) {
     return (
@@ -2073,6 +2118,7 @@ export function PreviewPanel({ selectedAsset, preview, assetData, loading, onExt
             data={data}
             assetData={assetData}
             selectedAsset={selectedAsset}
+            onOpenModelViewer={onOpenModelViewer}
           />
         )}
       </div>

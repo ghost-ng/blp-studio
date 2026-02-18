@@ -38,6 +38,7 @@ nul
 
 # Dev scratch / research files
 dev/
+docs/
 
 # vgmstream binaries (downloaded at build time)
 resources/vgmstream-cli.exe

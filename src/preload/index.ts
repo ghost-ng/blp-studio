@@ -138,6 +138,14 @@ export interface ElectronAPI {
   } | null>
   listAnimations: (boneCount: number) => Promise<{ name: string; size: number }[]>
   listSkeletons: () => Promise<{ name: string; size: number }[]>
+  parseModel: (blpPath: string) => Promise<{
+    meshes: { positions: number[]; indices: number[]; normals: number[] | null; uvs: number[] | null; boneIndices: number[] | null; boneWeights: number[] | null; vertexCount: number; triangleCount: number; materialHash: number; materialName: string }[]
+    componentCount: number
+    skeletons: { hash: number; deformerStart: number; deformerCount: number }[]
+    deformers: { nameHash: number; transformIndex: number; parent: number; inverseBind: { position: number[]; scale: number; rotation: number[] } }[]
+    skeletonBlobName: string | null
+  } | null>
+  loadModelTextures: (blpPath: string, materialNames: string[]) => Promise<Record<string, { diffuse?: string; normal?: string; orm?: string }> | null>
 }
 
 const api: ElectronAPI = {
@@ -235,6 +243,8 @@ const api: ElectronAPI = {
   parseAnimation: (name) => ipcRenderer.invoke('asset:parse-animation', name),
   listAnimations: (boneCount) => ipcRenderer.invoke('asset:list-animations', boneCount),
   listSkeletons: () => ipcRenderer.invoke('asset:list-skeletons'),
+  parseModel: (blpPath) => ipcRenderer.invoke('model:parse', blpPath),
+  loadModelTextures: (blpPath, materialNames) => ipcRenderer.invoke('model:load-textures', blpPath, materialNames),
 }
 
 contextBridge.exposeInMainWorld('electronAPI', api)
