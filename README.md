@@ -4,10 +4,18 @@ A desktop tool for browsing and previewing art assets inside Civilization VII's 
 
 Thanks to the [Civ7 Modding Helpline Discord](https://discord.gg/eNxHM8PV) community for inspiration and feedback.
 
+## Screenshots
+
+| Texture Browser | Wwise SoundBank Preview | 3D Model Viewer |
+|:-:|:-:|:-:|
+| ![Texture Browser](assets/image1.jpg) | ![SoundBank Preview](assets/image2.jpg) | ![3D Model Viewer](assets/image3.jpg) |
+
 ## Features
 
 - **Browse** BLP packages -- textures, blobs, GPU buffers, and sound banks
 - **Preview** textures with zoom, channel isolation, and background toggles
+- **3D Viewer** -- textured mesh rendering with skeleton overlay, vertex skinning, and animation playback
+- **Sound Banks** -- Wwise SoundBank parsing with embedded audio extraction and playback
 - **DDS Viewer** -- inspect DDS files, export to PNG/JPG, batch-convert, side-by-side compare
 - **Extract** individual assets or entire packages
 - **Replace** assets and export as mod packages (experimental -- enable in Settings)
